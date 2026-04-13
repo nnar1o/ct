@@ -1,0 +1,7 @@
+tool = "go"
+enabled = true
+aliases = ["go"]
+warning_patterns = ["warning", "deprecated"]
+error_patterns = ["panic:", "fatal error:", "build failed", "test failed", "undefined:"]
+error_capture_patterns = ["panic:", "fatal error:", "build failed", "test failed", "undefined:"]
+detection_regex = ['(?i)^go: downloading ', '(?i)^#\s+\S+', '(?i)^ok\s+\S+\s+\d+\.\d+s', '(?i)^FAIL\s+\S+']

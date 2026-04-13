@@ -1,0 +1,5 @@
+t.c:7:39: error: cannot initialize a parameter of type 'char *' with an rvalue of type 'int'
+int f() { return strchr("hello world",3); }
+                                      ^
+a.cpp:(.text+0x15): undefined reference to `run()'
+collect2: error: ld returned 1 exit status

@@ -1,0 +1,1352 @@
+use chrono::Utc;
+use ct::ctlog::{ct_home, logs_dir, now_ts};
+use regex::Regex;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::{TerminalOptions, Viewport};
+use serde::Deserialize;
+use std::collections::{HashMap, VecDeque};
+use std::env;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{self, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+const MAX_COMPACT_REFRESH_HZ: u64 = 20;
+const TAIL_LINES: usize = 5;
+const ADAPTIVE_COMPACT_AFTER_SECS: u64 = 2;
+const DEFAULT_MAX_ERROR_LINES: usize = 5;
+const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 16] = [
+    ("cargo.toml", include_str!("../filters.d/cargo.toml")),
+    ("maven.toml", include_str!("../filters.d/maven.toml")),
+    ("gradle.toml", include_str!("../filters.d/gradle.toml")),
+    ("npm.toml", include_str!("../filters.d/npm.toml")),
+    ("pnpm.toml", include_str!("../filters.d/pnpm.toml")),
+    ("yarn.toml", include_str!("../filters.d/yarn.toml")),
+    ("gcc.toml", include_str!("../filters.d/gcc.toml")),
+    ("clang.toml", include_str!("../filters.d/clang.toml")),
+    ("cpp.toml", include_str!("../filters.d/cpp.toml")),
+    ("make.toml", include_str!("../filters.d/make.toml")),
+    ("cmake.toml", include_str!("../filters.d/cmake.toml")),
+    ("go.toml", include_str!("../filters.d/go.toml")),
+    ("pytest.toml", include_str!("../filters.d/pytest.toml")),
+    ("dotnet.toml", include_str!("../filters.d/dotnet.toml")),
+    ("jest.toml", include_str!("../filters.d/jest.toml")),
+    ("vitest.toml", include_str!("../filters.d/vitest.toml")),
+];
+
+fn compact_refresh_interval() -> Duration {
+    let ms = (1000 / MAX_COMPACT_REFRESH_HZ).max(1);
+    Duration::from_millis(ms)
+}
+
+#[derive(Clone, Default)]
+struct CompactStats {
+    line_count: u64,
+    warning_count: u64,
+    error_count: u64,
+    last_error: String,
+}
+
+#[derive(Clone, Default)]
+struct CommandSummary {
+    warning_count: u64,
+    error_count: u64,
+    error_lines: VecDeque<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct CtConfig {
+    #[serde(default)]
+    output: OutputConfig,
+    #[serde(default)]
+    filters: FiltersConfig,
+    #[serde(default)]
+    heuristics: HeuristicsConfig,
+}
+
+#[derive(Clone, Deserialize)]
+struct OutputConfig {
+    #[serde(default = "default_max_error_lines")]
+    max_error_lines: usize,
+}
+
+#[derive(Clone, Deserialize)]
+struct FiltersConfig {
+    #[serde(flatten)]
+    tools: HashMap<String, CommandFilterConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+struct CommandFilterConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default = "default_warning_patterns")]
+    warning_patterns: Vec<String>,
+    #[serde(default = "default_error_patterns")]
+    error_patterns: Vec<String>,
+    #[serde(default = "default_error_capture_patterns")]
+    error_capture_patterns: Vec<String>,
+    #[serde(default)]
+    detection_regex: Vec<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct HeuristicsConfig {
+    #[serde(default = "default_auto_detect_log_type")]
+    auto_detect_log_type: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct CtConfigFile {
+    #[serde(default)]
+    output: OutputConfigFile,
+    #[serde(default)]
+    filters: HashMap<String, CommandFilterConfig>,
+    #[serde(default)]
+    heuristics: HeuristicsConfigFile,
+}
+
+#[derive(Deserialize, Default)]
+struct OutputConfigFile {
+    max_error_lines: Option<usize>,
+}
+
+#[derive(Deserialize, Default)]
+struct HeuristicsConfigFile {
+    auto_detect_log_type: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct FilterProfileFile {
+    tool: String,
+    #[serde(flatten)]
+    filter: CommandFilterConfig,
+}
+
+impl Default for CommandFilterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            aliases: Vec::new(),
+            warning_patterns: default_warning_patterns(),
+            error_patterns: default_error_patterns(),
+            error_capture_patterns: default_error_capture_patterns(),
+            detection_regex: Vec::new(),
+        }
+    }
+}
+
+impl Default for CtConfig {
+    fn default() -> Self {
+        Self {
+            output: OutputConfig::default(),
+            filters: FiltersConfig::default(),
+            heuristics: HeuristicsConfig::default(),
+        }
+    }
+}
+
+impl Default for FiltersConfig {
+    fn default() -> Self {
+        Self {
+            tools: HashMap::new(),
+        }
+    }
+}
+
+impl Default for HeuristicsConfig {
+    fn default() -> Self {
+        Self {
+            auto_detect_log_type: default_auto_detect_log_type(),
+        }
+    }
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            max_error_lines: default_max_error_lines(),
+        }
+    }
+}
+
+fn default_max_error_lines() -> usize {
+    DEFAULT_MAX_ERROR_LINES
+}
+
+fn default_warning_patterns() -> Vec<String> {
+    vec!["warning:".to_string(), "[warning]".to_string()]
+}
+
+fn default_error_patterns() -> Vec<String> {
+    vec![
+        "error:".to_string(),
+        "error[".to_string(),
+        "[error]".to_string(),
+        "build failure".to_string(),
+    ]
+}
+
+fn default_error_capture_patterns() -> Vec<String> {
+    vec![
+        "error:".to_string(),
+        "error[".to_string(),
+        "[error]".to_string(),
+        "build failure".to_string(),
+    ]
+}
+
+fn default_auto_detect_log_type() -> bool {
+    true
+}
+
+#[derive(Clone)]
+struct HeuristicCandidate {
+    tool: String,
+    filter: CommandFilterConfig,
+    regexes: Vec<Regex>,
+}
+
+#[derive(Clone)]
+struct HeuristicDetector {
+    candidates: Arc<Vec<HeuristicCandidate>>,
+    selected: Arc<Mutex<Option<(String, CommandFilterConfig)>>>,
+}
+
+impl HeuristicDetector {
+    fn from_config(cfg: &CtConfig) -> Option<Self> {
+        if !cfg.heuristics.auto_detect_log_type {
+            return None;
+        }
+
+        let mut candidates = Vec::new();
+        for (tool, filter) in &cfg.filters.tools {
+            if !filter.enabled || filter.detection_regex.is_empty() {
+                continue;
+            }
+
+            let regexes = filter
+                .detection_regex
+                .iter()
+                .filter_map(|pattern| Regex::new(pattern).ok())
+                .collect::<Vec<_>>();
+            if regexes.is_empty() {
+                continue;
+            }
+
+            candidates.push(HeuristicCandidate {
+                tool: tool.to_string(),
+                filter: filter.clone(),
+                regexes,
+            });
+        }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            candidates: Arc::new(candidates),
+            selected: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn selected_filter(&self) -> Option<CommandFilterConfig> {
+        self.selected
+            .lock()
+            .ok()
+            .and_then(|v| v.as_ref().map(|(_, filter)| filter.clone()))
+    }
+
+    fn detect_line_if_needed(&self, line: &str) -> Option<(String, CommandFilterConfig)> {
+        if let Ok(selected) = self.selected.lock()
+            && selected.is_some()
+        {
+            return None;
+        }
+
+        for candidate in self.candidates.iter() {
+            if candidate.regexes.iter().any(|re| re.is_match(line)) {
+                let detected = (candidate.tool.clone(), candidate.filter.clone());
+                if let Ok(mut selected) = self.selected.lock()
+                    && selected.is_none()
+                {
+                    *selected = Some(detected.clone());
+                    return Some(detected);
+                }
+                return None;
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Clone)]
+struct RunLogger {
+    file: Arc<Mutex<File>>,
+    log_path: PathBuf,
+}
+
+#[derive(Clone)]
+struct BufferedChunk {
+    seq: u64,
+    kind: String,
+    data: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct CaptureOptions {
+    passthrough: Arc<AtomicBool>,
+    output_flag: Arc<AtomicBool>,
+    tail_lines: Arc<Mutex<VecDeque<String>>>,
+    stats: Arc<Mutex<CompactStats>>,
+    command_summary: Option<Arc<Mutex<CommandSummary>>>,
+    command_filter: Option<CommandFilterConfig>,
+    heuristic_detector: Option<HeuristicDetector>,
+    max_error_lines: usize,
+    buffered_chunks: Option<Arc<Mutex<Vec<BufferedChunk>>>>,
+    buffer_enabled: Option<Arc<AtomicBool>>,
+    seq: Option<Arc<AtomicU64>>,
+}
+
+impl RunLogger {
+    fn new() -> io::Result<Self> {
+        let dir = logs_dir()?;
+        fs::create_dir_all(&dir)?;
+
+        let run_id = format!("{}-{}", Utc::now().timestamp_micros(), process::id());
+        let log_path = dir.join(format!("{run_id}.log"));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+            log_path,
+        })
+    }
+
+    fn log_json(&self, kind: &str, text: &str) {
+        if let Ok(payload) = serde_json::to_string(text) {
+            self.log_raw(kind, &payload);
+        }
+    }
+
+    fn log_exit(&self, code: i32) {
+        self.log_raw("EXIT", &code.to_string());
+    }
+
+    fn set_latest(&self) {
+        if let Some(name) = self.log_path.file_name().and_then(|x| x.to_str()) {
+            let latest_path = self.log_path.with_file_name(".latest");
+            let _ = fs::write(latest_path, name);
+        }
+    }
+
+    fn log_raw(&self, kind: &str, payload: &str) {
+        let line = format!("{} {kind} {payload}\n", now_ts());
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+
+    fn from_path(path: PathBuf) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self {
+            file: Arc::new(Mutex::new(file)),
+            log_path: path,
+        })
+    }
+
+    fn log_path_string(&self) -> String {
+        self.log_path.display().to_string()
+    }
+}
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let code = run(args);
+    process::exit(code);
+}
+
+fn run(args: Vec<String>) -> i32 {
+    if args.is_empty() {
+        print_usage();
+        return 2;
+    }
+
+    match args[0].as_str() {
+        "--async-runner" => run_async_runner(&args[1..]),
+        "--shell-bridge" => shell_bridge(&args[1..]),
+        "--compact" | "-c" => {
+            if args.len() < 2 {
+                eprintln!("usage: ct --compact <command> [args...]");
+                2
+            } else {
+                run_external(&args[1], &args[2..], true)
+            }
+        }
+        "mcp" => {
+            eprintln!("ct mcp: not implemented in this MVP yet");
+            1
+        }
+        "cd" => {
+            eprintln!("ct: 'cd' requires shell integration. Run ct-install and source ~/.bashrc");
+            2
+        }
+        "-a" => run_async_mode(&args[1..]),
+        _ => run_external(&args[0], &args[1..], false),
+    }
+}
+
+fn print_usage() {
+    eprintln!("usage: ct <command> [args...]");
+    eprintln!("       ct --compact <command> [args...]");
+    eprintln!("       ct -a <command> [args...]");
+    eprintln!("       ct mcp");
+    eprintln!("       ct --shell-bridge cd [args...]");
+}
+
+fn run_async_mode(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!("usage: ct -a <command> [args...]");
+        return 2;
+    }
+
+    let logger = match RunLogger::new() {
+        Ok(l) => l,
+        Err(err) => {
+            eprintln!("ct: failed to initialize logger: {err}");
+            return 1;
+        }
+    };
+
+    logger.log_json("CMD", &format_command(&args[0], &args[1..]));
+    logger.log_raw("MODE", "\"async\"");
+    logger.set_latest();
+
+    let self_exe = match env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("ct: failed to resolve executable path: {err}");
+            return 1;
+        }
+    };
+
+    let mut cmd = Command::new(self_exe);
+    cmd.arg("--async-runner")
+        .arg(logger.log_path_string())
+        .arg(&args[0])
+        .args(&args[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    match cmd.spawn() {
+        Ok(child) => {
+            logger.log_raw("ASYNC", &child.id().to_string());
+            println!("STARTED pid={}", child.id());
+            0
+        }
+        Err(err) => {
+            let msg = format!("ct: failed to start async runner: {err}");
+            eprintln!("{msg}");
+            logger.log_json("STDERR", &msg);
+            logger.log_exit(1);
+            1
+        }
+    }
+}
+
+fn run_async_runner(args: &[String]) -> i32 {
+    if args.len() < 2 {
+        return 2;
+    }
+
+    let log_path = PathBuf::from(&args[0]);
+    let cmd = &args[1];
+    let cmd_args = &args[2..];
+
+    let logger = match RunLogger::from_path(log_path) {
+        Ok(l) => l,
+        Err(_) => return 1,
+    };
+
+    let mut child = match Command::new(cmd)
+        .args(cmd_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            let code = map_spawn_error_code(&err);
+            logger.log_json("STDERR", &format_spawn_error(cmd, &err));
+            logger.log_exit(code);
+            return code;
+        }
+    };
+
+    logger.log_raw("PID", &child.id().to_string());
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let out_logger = logger.clone();
+    let out_thread = thread::spawn(move || {
+        if let Some(mut reader) = stdout {
+            let _ = capture_stream(&mut reader, "STDOUT", Some(&out_logger), None);
+        }
+    });
+
+    let err_logger = logger.clone();
+    let err_thread = thread::spawn(move || {
+        if let Some(mut reader) = stderr {
+            let _ = capture_stream(&mut reader, "STDERR", Some(&err_logger), None);
+        }
+    });
+
+    let code = match child.wait() {
+        Ok(status) => exit_code(status),
+        Err(_) => 1,
+    };
+
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    logger.log_exit(code);
+    code
+}
+
+fn shell_bridge(args: &[String]) -> i32 {
+    if args.is_empty() {
+        eprintln!("ct --shell-bridge: missing command");
+        return 2;
+    }
+
+    if args[0] != "cd" {
+        eprintln!("ct --shell-bridge: only 'cd' is supported in MVP");
+        return 2;
+    }
+
+    let mut script = String::from("cd");
+    for arg in &args[1..] {
+        script.push(' ');
+        script.push_str(&shell_escape(arg));
+    }
+    println!("__CT_BUILTIN__ {script}");
+    0
+}
+
+fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool) -> i32 {
+    let config = load_global_config();
+    let active_filter = command_filter_for(cmd, &config);
+    let active_filter_cfg = active_filter.map(|(_, filter)| filter.clone());
+    let heuristic_detector = if active_filter.is_none() {
+        HeuristicDetector::from_config(&config)
+    } else {
+        None
+    };
+    let max_error_lines = config.output.max_error_lines;
+    let filtered_mode = active_filter.is_some();
+    let summary_mode = filtered_mode || heuristic_detector.is_some();
+    let compact_mode = force_compact || filtered_mode;
+    let interactive_tty = io::stderr().is_terminal();
+    let adaptive_compact = interactive_tty && !compact_mode;
+    let had_output = Arc::new(AtomicBool::new(false));
+    let passthrough_enabled = Arc::new(AtomicBool::new(!adaptive_compact && !compact_mode));
+    let compact_enabled = Arc::new(AtomicBool::new(compact_mode));
+    let compact_used = Arc::new(AtomicBool::new(compact_mode));
+    let process_running = Arc::new(AtomicBool::new(true));
+    let buffer_enabled = Arc::new(AtomicBool::new(adaptive_compact));
+    let buffered_chunks = Arc::new(Mutex::new(Vec::<BufferedChunk>::new()));
+    let chunk_seq = Arc::new(AtomicU64::new(0));
+    let tail_lines = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_LINES)));
+    let stats = Arc::new(Mutex::new(CompactStats::default()));
+    let command_summary = if summary_mode {
+        Some(Arc::new(Mutex::new(CommandSummary::default())))
+    } else {
+        None
+    };
+    let logger = RunLogger::new().ok();
+    if let Some(l) = &logger {
+        l.log_json("CMD", &format_command(cmd, cmd_args));
+        if let Some((tool, _)) = active_filter {
+            l.log_json("FILTER", tool);
+        }
+    }
+
+    let mut child = match Command::new(cmd)
+        .args(cmd_args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            let code = map_spawn_error_code(&err);
+            let msg = format_spawn_error(cmd, &err);
+            eprintln!("{msg}");
+            if let Some(l) = &logger {
+                l.log_json("STDERR", &msg);
+                l.log_exit(code);
+                l.set_latest();
+            }
+            return code;
+        }
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    if adaptive_compact {
+        let running = Arc::clone(&process_running);
+        let compact_switch = Arc::clone(&compact_enabled);
+        let passthrough_switch = Arc::clone(&passthrough_enabled);
+        let used_flag = Arc::clone(&compact_used);
+        let buffering_switch = Arc::clone(&buffer_enabled);
+        let buffered = Arc::clone(&buffered_chunks);
+        let _ = thread::spawn(move || {
+            thread::sleep(Duration::from_secs(ADAPTIVE_COMPACT_AFTER_SECS));
+            if running.load(Ordering::Relaxed) {
+                compact_switch.store(true, Ordering::Relaxed);
+                passthrough_switch.store(false, Ordering::Relaxed);
+                used_flag.store(true, Ordering::Relaxed);
+                buffering_switch.store(false, Ordering::Relaxed);
+                if let Ok(mut b) = buffered.lock() {
+                    b.clear();
+                }
+            }
+        });
+    }
+
+    let spinner_running = Arc::new(AtomicBool::new(true));
+    let spinner_thread = if interactive_tty && !compact_mode {
+        let running = Arc::clone(&spinner_running);
+        let output_seen = Arc::clone(&had_output);
+        let spinner_label = format_command(cmd, cmd_args);
+        Some(thread::spawn(move || {
+            spin_wait(running, output_seen, spinner_label);
+        }))
+    } else {
+        None
+    };
+
+    let out_logger = logger.clone();
+    let out_capture = CaptureOptions {
+        passthrough: Arc::clone(&passthrough_enabled),
+        output_flag: Arc::clone(&had_output),
+        tail_lines: Arc::clone(&tail_lines),
+        stats: Arc::clone(&stats),
+        command_summary: command_summary.clone(),
+        command_filter: active_filter_cfg.clone(),
+        heuristic_detector: heuristic_detector.clone(),
+        max_error_lines,
+        buffered_chunks: Some(Arc::clone(&buffered_chunks)),
+        buffer_enabled: Some(Arc::clone(&buffer_enabled)),
+        seq: Some(Arc::clone(&chunk_seq)),
+    };
+    let out_thread = thread::spawn(move || {
+        if let Some(mut reader) = stdout {
+            let _ = capture_stream(
+                &mut reader,
+                "STDOUT",
+                out_logger.as_ref(),
+                Some(out_capture),
+            );
+        }
+    });
+
+    let err_logger = logger.clone();
+    let err_capture = CaptureOptions {
+        passthrough: Arc::clone(&passthrough_enabled),
+        output_flag: Arc::clone(&had_output),
+        tail_lines: Arc::clone(&tail_lines),
+        stats: Arc::clone(&stats),
+        command_summary: command_summary.clone(),
+        command_filter: active_filter_cfg,
+        heuristic_detector,
+        max_error_lines,
+        buffered_chunks: Some(Arc::clone(&buffered_chunks)),
+        buffer_enabled: Some(Arc::clone(&buffer_enabled)),
+        seq: Some(Arc::clone(&chunk_seq)),
+    };
+    let err_thread = thread::spawn(move || {
+        if let Some(mut reader) = stderr {
+            let _ = capture_stream(
+                &mut reader,
+                "STDERR",
+                err_logger.as_ref(),
+                Some(err_capture),
+            );
+        }
+    });
+
+    let compact_running = Arc::new(AtomicBool::new(true));
+    let compact_renderer = if interactive_tty {
+        let running = Arc::clone(&compact_running);
+        let tail = Arc::clone(&tail_lines);
+        let compact_on = Arc::clone(&compact_enabled);
+        let compact_stats = Arc::clone(&stats);
+        let compact_pid = child.id();
+        let compact_cmd = format_command(cmd, cmd_args);
+        Some(thread::spawn(move || {
+            compact_tail_renderer(
+                running,
+                compact_on,
+                tail,
+                compact_stats,
+                compact_pid,
+                compact_cmd,
+                TAIL_LINES,
+            );
+        }))
+    } else {
+        None
+    };
+
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(err) => {
+            let msg = format!("ct: failed waiting for process: {err}");
+            eprintln!("{msg}");
+            if let Some(l) = &logger {
+                l.log_json("STDERR", &msg);
+                l.log_exit(1);
+                l.set_latest();
+            }
+            return 1;
+        }
+    };
+
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    process_running.store(false, Ordering::Relaxed);
+    compact_running.store(false, Ordering::Relaxed);
+    if let Some(handle) = compact_renderer {
+        let _ = handle.join();
+    }
+    spinner_running.store(false, Ordering::Relaxed);
+    if let Some(handle) = spinner_thread {
+        let _ = handle.join();
+    }
+
+    let code = exit_code(status);
+    if let Some(l) = &logger {
+        l.log_exit(code);
+        l.set_latest();
+    }
+
+    if compact_used.load(Ordering::Relaxed) {
+        print_compact_result(code, command_summary.as_ref(), max_error_lines);
+    } else if adaptive_compact {
+        flush_buffered_output(&buffered_chunks);
+    }
+    code
+}
+
+fn command_filter_for<'a>(cmd: &str, cfg: &'a CtConfig) -> Option<(&'a str, &'a CommandFilterConfig)> {
+    let exec_name = std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(cmd);
+
+    for (tool, filter) in &cfg.filters.tools {
+        if !filter.enabled {
+            continue;
+        }
+        if tool == exec_name || filter.aliases.iter().any(|alias| alias == exec_name) {
+            return Some((tool.as_str(), filter));
+        }
+    }
+    None
+}
+
+fn capture_stream<R: Read>(
+    reader: &mut R,
+    kind: &str,
+    logger: Option<&RunLogger>,
+    options: Option<CaptureOptions>,
+) -> io::Result<()> {
+    let mut buf = [0_u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+
+        if let Some(opts) = &options {
+            opts.output_flag.store(true, Ordering::Relaxed);
+        }
+
+        let should_passthrough = options
+            .as_ref()
+            .map(|opts| opts.passthrough.load(Ordering::Relaxed))
+            .unwrap_or(true);
+
+        if should_passthrough {
+            if kind == "STDERR" {
+                let mut w = io::stderr().lock();
+                w.write_all(&buf[..n])?;
+                w.flush()?;
+            } else {
+                let mut w = io::stdout().lock();
+                w.write_all(&buf[..n])?;
+                w.flush()?;
+            }
+        } else if options
+            .as_ref()
+            .and_then(|opts| opts.buffer_enabled.as_ref())
+            .map(|flag| flag.load(Ordering::Relaxed))
+            .unwrap_or(false)
+        {
+            let chunk_id = options
+                .as_ref()
+                .and_then(|opts| opts.seq.as_ref())
+                .map(|seq| seq.fetch_add(1, Ordering::Relaxed))
+                .unwrap_or(0);
+            if let Some(storage) = options
+                .as_ref()
+                .and_then(|opts| opts.buffered_chunks.as_ref())
+            {
+                if let Ok(mut all) = storage.lock() {
+                    all.push(BufferedChunk {
+                        seq: chunk_id,
+                        kind: kind.to_string(),
+                        data: buf[..n].to_vec(),
+                    });
+                }
+            }
+        }
+
+        if let Some(l) = logger {
+            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            l.log_json(kind, &text);
+        }
+
+        if let Some(opts) = &options {
+            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            for line in text.lines() {
+                push_tail_line(&opts.tail_lines, kind, line, TAIL_LINES);
+                update_stats(&opts.stats, line);
+                if let Some(summary) = &opts.command_summary {
+                    let mut selected_filter = opts.command_filter.clone();
+                    if selected_filter.is_none()
+                        && let Some(detector) = &opts.heuristic_detector
+                    {
+                        if let Some((tool, filter)) = detector.detect_line_if_needed(line) {
+                            if let Some(l) = logger {
+                                l.log_json("FILTER", &tool);
+                            }
+                            selected_filter = Some(filter);
+                        } else {
+                            selected_filter = detector.selected_filter();
+                        }
+                    }
+
+                    update_command_summary(
+                        summary,
+                        line,
+                        selected_filter.as_ref(),
+                        opts.max_error_lines,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn update_command_summary(
+    summary: &Arc<Mutex<CommandSummary>>,
+    line: &str,
+    command_filter: Option<&CommandFilterConfig>,
+    max_error_lines: usize,
+) {
+    let cleaned = strip_leading_timestamp(line);
+    if cleaned.is_empty() {
+        return;
+    }
+    let lower = cleaned.to_ascii_lowercase();
+    let warning_patterns = command_filter
+        .map(|f| f.warning_patterns.as_slice())
+        .unwrap_or(&[]);
+    let error_patterns = command_filter
+        .map(|f| f.error_patterns.as_slice())
+        .unwrap_or(&[]);
+    let error_capture_patterns = command_filter
+        .map(|f| f.error_capture_patterns.as_slice())
+        .unwrap_or(&[]);
+
+    let is_warning = if warning_patterns.is_empty() {
+        lower.contains("warning")
+    } else {
+        contains_any_pattern(&lower, warning_patterns)
+    };
+    let is_error = if error_patterns.is_empty() {
+        lower.contains("error") || lower.contains("build failure")
+    } else {
+        contains_any_pattern(&lower, error_patterns)
+    };
+    let should_capture_error = if error_capture_patterns.is_empty() {
+        is_error
+    } else {
+        contains_any_pattern(&lower, error_capture_patterns)
+    };
+
+    if let Ok(mut s) = summary.lock() {
+        if is_warning {
+            s.warning_count += 1;
+        }
+        if is_error {
+            s.error_count += 1;
+            if should_capture_error {
+                if max_error_lines > 0 {
+                    s.error_lines.push_back(cleaned.to_string());
+                    while s.error_lines.len() > max_error_lines {
+                        let _ = s.error_lines.pop_front();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn contains_any_pattern(lower_line: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .map(|pattern| pattern.trim().to_ascii_lowercase())
+        .filter(|pattern| !pattern.is_empty())
+        .any(|pattern| lower_line.contains(&pattern))
+}
+
+fn print_compact_result(
+    code: i32,
+    command_summary: Option<&Arc<Mutex<CommandSummary>>>,
+    max_error_lines: usize,
+) {
+    if code == 0 {
+        println!("SUCCESS");
+        return;
+    }
+
+    println!("FAILED");
+    if let Some(summary) = command_summary {
+        let data = match summary.lock() {
+            Ok(s) => s.clone(),
+            Err(_) => CommandSummary::default(),
+        };
+        if !data.error_lines.is_empty() {
+            for line in data.error_lines.into_iter().take(max_error_lines) {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+fn load_global_config() -> CtConfig {
+    let mut cfg = CtConfig::default();
+
+    for (tool, profile) in load_embedded_filter_profiles() {
+        cfg.filters.tools.insert(tool, profile);
+    }
+
+    let home = match ct_home() {
+        Ok(h) => h,
+        Err(_) => return cfg,
+    };
+
+    for (tool, profile) in load_filter_profiles(&home) {
+        cfg.filters.tools.insert(tool, profile);
+    }
+
+    let path = home.join("config.toml");
+    let raw = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return cfg,
+    };
+
+    let user_cfg = match toml::from_str::<CtConfigFile>(&raw) {
+        Ok(v) => v,
+        Err(_) => return cfg,
+    };
+
+    if let Some(max_error_lines) = user_cfg.output.max_error_lines {
+        cfg.output.max_error_lines = max_error_lines;
+    }
+    if let Some(auto_detect_log_type) = user_cfg.heuristics.auto_detect_log_type {
+        cfg.heuristics.auto_detect_log_type = auto_detect_log_type;
+    }
+    for (tool, filter) in user_cfg.filters {
+        cfg.filters.tools.insert(tool, filter);
+    }
+
+    cfg
+}
+
+fn load_filter_profiles(home: &Path) -> HashMap<String, CommandFilterConfig> {
+    let mut out = HashMap::new();
+    let dir = home.join("filters.d");
+    let entries = match fs::read_dir(dir) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("toml") {
+            continue;
+        }
+
+        let raw = match fs::read_to_string(&path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let profile = match toml::from_str::<FilterProfileFile>(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let tool = profile.tool.trim();
+        if tool.is_empty() {
+            continue;
+        }
+
+        out.insert(
+            tool.to_string(),
+            profile.filter,
+        );
+    }
+
+    out
+}
+
+fn load_embedded_filter_profiles() -> HashMap<String, CommandFilterConfig> {
+    let mut out = HashMap::new();
+    for (_name, raw) in BUILTIN_FILTER_PROFILE_FILES {
+        let profile = match toml::from_str::<FilterProfileFile>(raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let tool = profile.tool.trim();
+        if tool.is_empty() {
+            continue;
+        }
+        out.insert(tool.to_string(), profile.filter);
+    }
+    out
+}
+
+fn flush_buffered_output(buffered_chunks: &Arc<Mutex<Vec<BufferedChunk>>>) {
+    let mut chunks = match buffered_chunks.lock() {
+        Ok(c) => c.clone(),
+        Err(_) => Vec::new(),
+    };
+    chunks.sort_by_key(|c| c.seq);
+
+    for chunk in chunks {
+        if chunk.kind == "STDERR" {
+            let mut w = io::stderr().lock();
+            let _ = w.write_all(&chunk.data);
+            let _ = w.flush();
+        } else {
+            let mut w = io::stdout().lock();
+            let _ = w.write_all(&chunk.data);
+            let _ = w.flush();
+        }
+    }
+}
+
+fn push_tail_line(tail: &Arc<Mutex<VecDeque<String>>>, kind: &str, line: &str, max: usize) {
+    let cleaned = strip_leading_timestamp(line);
+    if cleaned.is_empty() {
+        return;
+    }
+
+    if let Ok(mut q) = tail.lock() {
+        let entry = if kind == "STDERR" {
+            format!("[err] {cleaned}")
+        } else {
+            cleaned.to_string()
+        };
+        q.push_back(entry);
+        while q.len() > max {
+            let _ = q.pop_front();
+        }
+    }
+}
+
+fn compact_tail_renderer(
+    running: Arc<AtomicBool>,
+    compact_enabled: Arc<AtomicBool>,
+    tail_lines: Arc<Mutex<VecDeque<String>>>,
+    stats: Arc<Mutex<CompactStats>>,
+    pid: u32,
+    command: String,
+    max: usize,
+) {
+    let mut last_snapshot: Vec<String> = Vec::new();
+    let mut spinner_idx = 0usize;
+    let start = Instant::now();
+    let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let mut terminal = None;
+    let viewport_height = (max + 2) as u16;
+
+    let refresh_interval = compact_refresh_interval();
+
+    while running.load(Ordering::Relaxed) {
+        if !compact_enabled.load(Ordering::Relaxed) {
+            thread::sleep(refresh_interval);
+            continue;
+        }
+
+        if terminal.is_none() {
+            let options = TerminalOptions {
+                viewport: Viewport::Inline(viewport_height),
+            };
+            terminal = ratatui::try_init_with_options(options).ok();
+        }
+
+        let snapshot = match tail_lines.lock() {
+            Ok(q) => q.iter().take(max).cloned().collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+
+        let state = match stats.lock() {
+            Ok(s) => s.clone(),
+            Err(_) => CompactStats::default(),
+        };
+
+        let elapsed = format_elapsed(start.elapsed());
+        let header = format_compact_header(
+            spinner_frames[spinner_idx % spinner_frames.len()],
+            pid,
+            &command,
+            &elapsed,
+            &state,
+        );
+        spinner_idx += 1;
+
+        if snapshot != last_snapshot || spinner_idx % 2 == 0 {
+            if let Some(term) = terminal.as_mut() {
+                let _ = term.draw(|frame| {
+                    let areas = Layout::vertical([
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                        Constraint::Min(1),
+                    ])
+                    .split(frame.area());
+
+                    let header_line = Line::from(vec![
+                        Span::styled(
+                            format!("{} ", header.spinner),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            "RUNNING ",
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(
+                            "pid:{} t:{} cmd:{} lines:{} ",
+                            header.pid, header.elapsed, header.cmd_short, header.line_count
+                        )),
+                        Span::styled(
+                            format!("warn:{} ", header.warning_count),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            format!("err:{} ", header.error_count),
+                            Style::default().fg(Color::Red),
+                        ),
+                        Span::styled(
+                            format!("last:{}", header.last_error),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]);
+
+                    frame.render_widget(Paragraph::new(header_line), areas[0]);
+                    frame.render_widget(Paragraph::new(""), areas[1]);
+                    frame.render_widget(Paragraph::new(snapshot.join("\n")), areas[2]);
+                });
+            }
+            last_snapshot = snapshot;
+        }
+
+        thread::sleep(refresh_interval);
+    }
+
+    if terminal.is_some() {
+        let _ = ratatui::try_restore();
+    }
+}
+
+fn update_stats(stats: &Arc<Mutex<CompactStats>>, line: &str) {
+    let cleaned = strip_leading_timestamp(line);
+    let lower = cleaned.to_ascii_lowercase();
+    if let Ok(mut s) = stats.lock() {
+        s.line_count += 1;
+        if lower.contains("warning") {
+            s.warning_count += 1;
+        }
+        if lower.contains("error") {
+            s.error_count += 1;
+            s.last_error = cleaned.to_string();
+        }
+    }
+}
+
+fn strip_leading_timestamp(line: &str) -> &str {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some(end_idx) = rest.find(']')
+    {
+        return rest[end_idx + 1..].trim_start();
+    }
+    trimmed
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+struct CompactHeader {
+    spinner: char,
+    pid: u32,
+    elapsed: String,
+    cmd_short: String,
+    line_count: u64,
+    warning_count: u64,
+    error_count: u64,
+    last_error: String,
+}
+
+fn format_compact_header(
+    spinner: char,
+    pid: u32,
+    command: &str,
+    elapsed: &str,
+    stats: &CompactStats,
+) -> CompactHeader {
+    let cmd_short = truncate(command, 36);
+    let last_error = if stats.last_error.is_empty() {
+        "-".to_string()
+    } else {
+        truncate(&stats.last_error, 48)
+    };
+
+    CompactHeader {
+        spinner,
+        pid,
+        elapsed: elapsed.to_string(),
+        cmd_short,
+        line_count: stats.line_count,
+        warning_count: stats.warning_count,
+        error_count: stats.error_count,
+        last_error,
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let candidate: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{candidate}...")
+    } else {
+        candidate
+    }
+}
+
+fn spin_wait(running: Arc<AtomicBool>, output_seen: Arc<AtomicBool>, label: String) {
+    let frames = ['|', '/', '-', '\\'];
+    let mut idx = 0usize;
+    while running.load(Ordering::Relaxed) && !output_seen.load(Ordering::Relaxed) {
+        eprint!("\r{} Running {}", frames[idx % frames.len()], label);
+        let _ = io::stderr().flush();
+        idx += 1;
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    eprint!("\r\x1b[2K");
+    let _ = io::stderr().flush();
+}
+
+fn map_spawn_error_code(err: &io::Error) -> i32 {
+    match err.kind() {
+        io::ErrorKind::NotFound => 127,
+        io::ErrorKind::PermissionDenied => 126,
+        _ => 1,
+    }
+}
+
+fn format_spawn_error(cmd: &str, err: &io::Error) -> String {
+    match err.kind() {
+        io::ErrorKind::NotFound => format!("{cmd}: command not found"),
+        io::ErrorKind::PermissionDenied => format!("{cmd}: permission denied"),
+        _ => format!("ct: failed to run '{cmd}': {err}"),
+    }
+}
+
+fn exit_code(status: process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
+        }
+    }
+
+    1
+}
+
+fn format_command(cmd: &str, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(shell_escape(cmd));
+    for arg in args {
+        parts.push(shell_escape(arg));
+    }
+    parts.join(" ")
+}
+
+fn shell_escape(input: &str) -> String {
+    if input.is_empty() {
+        return "''".to_string();
+    }
+
+    if input.bytes().all(|b| {
+        matches!(
+            b,
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b':' | b'='
+        )
+    }) {
+        return input.to_string();
+    }
+
+    let escaped = input.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}

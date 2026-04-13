@@ -1,0 +1,7 @@
+tool = "vitest"
+enabled = true
+aliases = ["vitest"]
+warning_patterns = ["warn", "deprecated"]
+error_patterns = ["failed", "error", "unhandled errors", "test files"]
+error_capture_patterns = ["failed", "error", "unhandled errors", "test files"]
+detection_regex = ['(?i)^\s*RUN\s+v\d', '(?i)^\s*(PASS|FAIL)\s+', '(?i)^\s*Test Files\s+', '(?i)^\s*Duration\s+']

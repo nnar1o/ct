@@ -1,0 +1,7 @@
+tool = "maven"
+enabled = true
+aliases = ["mvn", "mvnw"]
+warning_patterns = ["[WARNING]", " warning "]
+error_patterns = ["[ERROR]", "compilation failure", "failed to execute goal", "there are test failures", "BUILD FAILURE"]
+error_capture_patterns = ["[ERROR]", "compilation failure", "failed to execute goal", "BUILD FAILURE"]
+detection_regex = ['(?i)^\[INFO\] Scanning for projects', '(?i)^\[INFO\] --- .+ @ .+ ---', '(?i)^\[INFO\] BUILD (SUCCESS|FAILURE)', '(?i)^\[ERROR\] ']

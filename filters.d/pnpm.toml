@@ -1,0 +1,7 @@
+tool = "pnpm"
+enabled = true
+aliases = ["pnpm"]
+warning_patterns = ["warn", "deprecated"]
+error_patterns = ["err_", "command failed", "fetch failed", "error"]
+error_capture_patterns = ["err_", "command failed", "fetch failed", "error"]
+detection_regex = ['(?i)^\s*Packages: \+\d+', '(?i)^\s*Progress: resolved ', '(?i)^\s*ERR_PNPM_', '(?i)^\s*dependencies:']

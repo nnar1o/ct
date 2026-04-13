@@ -1,0 +1,7 @@
+tool = "cpp"
+enabled = true
+aliases = ["g++", "clang++", "c++"]
+warning_patterns = [": warning:"]
+error_patterns = [": error:", "undefined reference to", "linker command failed", "collect2: error:"]
+error_capture_patterns = [": error:", "undefined reference to", "linker command failed", "collect2: error:"]
+detection_regex = ['^[^:\n]+:\d+:\d+: (warning|error):', '(?i)^(g\+\+|clang\+\+|c\+\+): (fatal )?error:', '(?i)^undefined reference to']

@@ -1,0 +1,5 @@
+npm ERR! code 1
+npm ERR! path C:\Users\Dell\Desktop\test\server\node_modules\deasync
+npm ERR! command failed
+npm ERR! command C:\WINDOWS\system32\cmd.exe /d /s /c node ./build.js
+npm ERR! Build failed

@@ -1,0 +1,7 @@
+tool = "gradle"
+enabled = true
+aliases = ["gradle", "gradlew"]
+warning_patterns = ["warning", "deprecated gradle features were used", "has been deprecated"]
+error_patterns = ["* what went wrong:", "execution failed for task", "build failed", "failure: build failed with an exception", "> failed"]
+error_capture_patterns = ["* what went wrong:", "execution failed for task", "build failed", "failure: build failed with an exception", "> failed"]
+detection_regex = ['(?i)^> Task ', '(?i)^\* What went wrong:', '(?i)^BUILD (SUCCESSFUL|FAILED) in ', '(?i)^FAILURE: Build failed']

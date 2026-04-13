@@ -1,0 +1,7 @@
+tool = "cmake"
+enabled = true
+aliases = ["cmake"]
+warning_patterns = ["cmake warning", "warning:"]
+error_patterns = ["cmake error", "error:", "ninja: build stopped: subcommand failed", "build failed"]
+error_capture_patterns = ["cmake error", "error:", "ninja: build stopped: subcommand failed", "build failed"]
+detection_regex = ['(?i)^-- Configuring done', '(?i)^CMake (Warning|Error)', '(?i)^-- Build files have been written to:', '(?i)^ninja: build stopped: subcommand failed']

@@ -1,0 +1,7 @@
+tool = "yarn"
+enabled = true
+aliases = ["yarn"]
+warning_patterns = ["warning", "yn006", "deprecated"]
+error_patterns = ["error", "yn000", "yn001", "command failed", "failed with errors"]
+error_capture_patterns = ["error", "yn000", "yn001", "failed with errors"]
+detection_regex = ['(?i)^yarn (run|install) v\d', '(?i)^\s*YN\d{4}:', '(?i)^\[\d+/\d+\]', '(?i)^Done in \d+\.\d+s']

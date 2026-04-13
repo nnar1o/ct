@@ -1,0 +1,7 @@
+tool = "pytest"
+enabled = true
+aliases = ["pytest"]
+warning_patterns = ["pytestwarning", "deprecationwarning", "warnings summary"]
+error_patterns = ["failed", "error", "e   ", "traceback", "short test summary info"]
+error_capture_patterns = ["e   ", "traceback", "failed", "error", "short test summary info"]
+detection_regex = ['(?i)^=+ test session starts =+', '(?i)^collected \d+ items', '(?i)^=+ short test summary info =+', '(?i)^FAILED\s+']

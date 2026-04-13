@@ -1,0 +1,7 @@
+tool = "jest"
+enabled = true
+aliases = ["jest"]
+warning_patterns = ["warn", "deprecated"]
+error_patterns = ["fail ", "test suite failed to run", "error", "tests failed"]
+error_capture_patterns = ["fail ", "test suite failed to run", "error", "tests failed"]
+detection_regex = ['(?i)^\s*PASS\s+', '(?i)^\s*FAIL\s+', '(?i)^Test Suites:\s+', '(?i)^Ran all test suites']

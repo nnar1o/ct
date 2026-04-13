@@ -1,0 +1,4 @@
+format-strings.c:91:13: warning: more '%' conversions than data arguments [-Wformat]
+  printf("%d");
+          ~^
+1 warning generated.

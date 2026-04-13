@@ -1,0 +1,7 @@
+tool = "clang"
+enabled = true
+aliases = ["clang"]
+warning_patterns = [": warning:"]
+error_patterns = [": error:", "undefined reference to", "linker command failed"]
+error_capture_patterns = [": error:", "undefined reference to", "linker command failed"]
+detection_regex = ['^[^:\n]+:\d+:\d+: (warning|error):', '(?i)^clang: error:', '(?i)^ld: error:']

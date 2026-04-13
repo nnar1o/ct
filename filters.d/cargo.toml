@@ -1,0 +1,7 @@
+tool = "cargo"
+enabled = true
+aliases = ["cargo"]
+warning_patterns = ["warning:"]
+error_patterns = ["error:", "error[", "could not compile", "build failed", "aborting due to"]
+error_capture_patterns = ["error:", "error[", "could not compile", "aborting due to"]
+detection_regex = ['(?i)^\s*Compiling\s+', '(?i)^\s*Finished\s+.*target\(s\)', '(?i)^\s*Running `cargo\s+', '(?i)^\s*error(\[[a-z0-9]+\])?:']

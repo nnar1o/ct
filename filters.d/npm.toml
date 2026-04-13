@@ -1,0 +1,7 @@
+tool = "npm"
+enabled = true
+aliases = ["npm"]
+warning_patterns = ["npm warn", "deprecated"]
+error_patterns = ["npm err!", "enoent", "eacces", "command failed", "code e"]
+error_capture_patterns = ["npm err!", "enoent", "eacces", "command failed", "code e"]
+detection_regex = ['(?i)^npm (warn|err)!?', '(?i)^> .+@\d+\.\d+\.\d+ ', '(?i)^added \d+ packages', '(?i)^found \d+ vulnerabilities']

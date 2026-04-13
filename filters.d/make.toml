@@ -1,0 +1,7 @@
+tool = "make"
+enabled = true
+aliases = ["make"]
+warning_patterns = ["warning:"]
+error_patterns = ["***", "error", "no rule to make target", "recipe for target", "stop."]
+error_capture_patterns = ["***", "no rule to make target", "recipe for target", "error"]
+detection_regex = ['(?i)^make(\[\d+\])?: ', '(?i)^\*\*\* ', '(?i)^No rule to make target', '(?i)^make: \*\*\*']

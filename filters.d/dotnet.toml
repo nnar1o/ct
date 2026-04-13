@@ -1,0 +1,7 @@
+tool = "dotnet"
+enabled = true
+aliases = ["dotnet"]
+warning_patterns = [" warning ", " warning cs", " warning nu"]
+error_patterns = [" error ", " error cs", " error nu", "build failed.", "unhandled exception."]
+error_capture_patterns = [" error ", " error cs", " error nu", "build failed.", "unhandled exception."]
+detection_regex = ['(?i)^\s*Determining projects to restore', '(?i)^\s*Restore completed in', '(?i)^\s*Build (succeeded|FAILED)\.', '(?i)^\s*\d+ Warning\(s\)']

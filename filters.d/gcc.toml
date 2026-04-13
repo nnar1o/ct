@@ -1,0 +1,7 @@
+tool = "gcc"
+enabled = true
+aliases = ["gcc"]
+warning_patterns = [": warning:"]
+error_patterns = [": error:", "undefined reference to", "collect2: error:"]
+error_capture_patterns = [": error:", "undefined reference to", "collect2: error:"]
+detection_regex = ['^[^:\n]+:\d+:\d+: (warning|error):', '(?i)^gcc: fatal error:', '(?i)^collect2: error:']

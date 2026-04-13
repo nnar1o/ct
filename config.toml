@@ -1,0 +1,5 @@
+[output]
+max_error_lines = 5
+
+[heuristics]
+auto_detect_log_type = true
