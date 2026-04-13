@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-assets:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cargo build --release --bins --target ${{ matrix.target }}
+
+      - name: Pack unix archive
+        if: matrix.archive == 'tar.gz'
+        id: pack-unix
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package_dir="ct-${version}-${{ matrix.target }}"
+
+          mkdir -p "${package_dir}"
+          cp "target/${{ matrix.target }}/release/ct" "${package_dir}/"
+          cp "target/${{ matrix.target }}/release/ct-ctl" "${package_dir}/"
+          cp "target/${{ matrix.target }}/release/ct-install" "${package_dir}/"
+
+          archive="${package_dir}.tar.gz"
+          tar -czf "${archive}" "${package_dir}"
+          echo "asset=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Pack windows archive
+        if: matrix.archive == 'zip'
+        id: pack-windows
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $packageDir = "ct-$version-${{ matrix.target }}"
+
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/ct.exe" "$packageDir/"
+          Copy-Item "target/${{ matrix.target }}/release/ct-ctl.exe" "$packageDir/"
+          Copy-Item "target/${{ matrix.target }}/release/ct-install.exe" "$packageDir/"
+
+          $archive = "$packageDir.zip"
+          Compress-Archive -Path $packageDir -DestinationPath $archive -Force
+          "asset=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.pack-unix.outputs.asset || steps.pack-windows.outputs.asset }}
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: build-assets
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
