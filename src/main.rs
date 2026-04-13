@@ -326,8 +326,10 @@ impl HeuristicDetector {
 #[derive(Clone)]
 struct RunLogger {
     file: Arc<Mutex<File>>,
+    sh_file: Arc<Mutex<Option<File>>>,
     log_path: PathBuf,
     start_ts_ms: i64,
+    seen_hashes: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -361,15 +363,23 @@ impl RunLogger {
 
         let run_id = format!("{}-{}", Utc::now().timestamp_micros(), process::id());
         let log_path = dir.join(format!("{run_id}.log"));
+        let sh_path = dir.join(format!("{run_id}.logsh"));
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&log_path)?;
+        let sh_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sh_path)
+            .ok();
 
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
+            sh_file: Arc::new(Mutex::new(sh_file)),
             log_path,
             start_ts_ms: Utc::now().timestamp_millis(),
+            seen_hashes: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -416,6 +426,24 @@ impl RunLogger {
         if let Ok(mut file) = self.file.lock() {
             let _ = file.write_all(line.as_bytes());
         }
+        let normalized: String = payload.chars().filter(|c| !c.is_ascii_digit()).collect();
+        let hash = format!("{:x}", md5::compute(normalized.as_bytes()));
+        let mut already_seen = false;
+        if let Ok(mut seen) = self.seen_hashes.lock() {
+            if seen.contains(&hash) {
+                already_seen = true;
+            } else {
+                seen.insert(hash.clone());
+            }
+        }
+        if !already_seen {
+            let sh_line = format!("{} {}\n", rel_ms, hash);
+            if let Ok(mut sh) = self.sh_file.lock() {
+                if let Some(ref mut f) = *sh {
+                    let _ = f.write_all(sh_line.as_bytes());
+                }
+            }
+        }
     }
 
     fn from_path(path: PathBuf) -> io::Result<Self> {
@@ -431,8 +459,10 @@ impl RunLogger {
             .unwrap_or_else(|| Utc::now().timestamp_millis());
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
+            sh_file: Arc::new(Mutex::new(None)),
             log_path: path,
             start_ts_ms,
+            seen_hashes: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
     }
 
@@ -443,10 +473,8 @@ impl RunLogger {
 
 fn default_level_for_kind(kind: &str) -> char {
     match kind {
-        "STDERR" => 'E',
-        "STDOUT" => 'I',
-        "MODE" | "ASYNC" | "PID" | "FILTER" => 'T',
-        "EXIT" => 'I',
+        "STDERR" => 'U',
+        "STDOUT" => 'U',
         _ => 'U',
     }
 }
