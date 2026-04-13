@@ -1,5 +1,5 @@
 use chrono::Utc;
-use ct::ctlog::{ct_home, logs_dir, now_ts};
+use ct::ctlog::{ct_home, logs_dir};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
@@ -55,8 +55,12 @@ fn adaptive_compact_enabled() -> bool {
 #[derive(Clone, Default)]
 struct CompactStats {
     line_count: u64,
+    fatal_count: u64,
     warning_count: u64,
     error_count: u64,
+    info_count: u64,
+    trace_count: u64,
+    unknown_count: u64,
     last_error: String,
 }
 
@@ -103,6 +107,22 @@ struct CommandFilterConfig {
     error_capture_patterns: Vec<String>,
     #[serde(default)]
     detection_regex: Vec<String>,
+    #[serde(default)]
+    level_patterns: LevelPatternsConfig,
+}
+
+#[derive(Clone, Deserialize, Default)]
+struct LevelPatternsConfig {
+    #[serde(default)]
+    fatal: Vec<String>,
+    #[serde(default)]
+    error: Vec<String>,
+    #[serde(default)]
+    warning: Vec<String>,
+    #[serde(default)]
+    info: Vec<String>,
+    #[serde(default)]
+    trace: Vec<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -147,6 +167,7 @@ impl Default for CommandFilterConfig {
             error_patterns: default_error_patterns(),
             error_capture_patterns: default_error_capture_patterns(),
             detection_regex: Vec::new(),
+            level_patterns: LevelPatternsConfig::default(),
         }
     }
 }
@@ -306,6 +327,7 @@ impl HeuristicDetector {
 struct RunLogger {
     file: Arc<Mutex<File>>,
     log_path: PathBuf,
+    start_ts_ms: i64,
 }
 
 #[derive(Clone)]
@@ -347,7 +369,15 @@ impl RunLogger {
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
             log_path,
+            start_ts_ms: Utc::now().timestamp_millis(),
         })
+    }
+
+    fn log_command(&self, command: &str) {
+        let line = format!("{} {command}\n", self.start_ts_ms);
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.write_all(line.as_bytes());
+        }
     }
 
     fn log_json(&self, kind: &str, text: &str) {
@@ -356,8 +386,15 @@ impl RunLogger {
         }
     }
 
+    fn log_json_with_level(&self, level: char, kind: &str, text: &str) {
+        if let Ok(payload) = serde_json::to_string(text) {
+            self.log_raw_with_level(level, kind, &payload);
+        }
+    }
+
     fn log_exit(&self, code: i32) {
-        self.log_raw("EXIT", &code.to_string());
+        let level = if code == 0 { 'I' } else { 'E' };
+        self.log_raw_with_level(level, "EXIT", &code.to_string());
     }
 
     fn set_latest(&self) {
@@ -368,7 +405,14 @@ impl RunLogger {
     }
 
     fn log_raw(&self, kind: &str, payload: &str) {
-        let line = format!("{} {kind} {payload}\n", now_ts());
+        self.log_raw_with_level(default_level_for_kind(kind), kind, payload);
+    }
+
+    fn log_raw_with_level(&self, level: char, kind: &str, payload: &str) {
+        let rel_ms = Utc::now()
+            .timestamp_millis()
+            .saturating_sub(self.start_ts_ms);
+        let line = format!("{rel_ms} {level} {kind} {payload}\n");
         if let Ok(mut file) = self.file.lock() {
             let _ = file.write_all(line.as_bytes());
         }
@@ -376,14 +420,34 @@ impl RunLogger {
 
     fn from_path(path: PathBuf) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let start_ts_ms = fs::read_to_string(&path)
+            .ok()
+            .and_then(|v| {
+                v.lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().next())
+                    .and_then(|ts| ts.parse::<i64>().ok())
+            })
+            .unwrap_or_else(|| Utc::now().timestamp_millis());
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
             log_path: path,
+            start_ts_ms,
         })
     }
 
     fn log_path_string(&self) -> String {
         self.log_path.display().to_string()
+    }
+}
+
+fn default_level_for_kind(kind: &str) -> char {
+    match kind {
+        "STDERR" => 'E',
+        "STDOUT" => 'I',
+        "MODE" | "ASYNC" | "PID" | "FILTER" => 'T',
+        "EXIT" => 'I',
+        _ => 'U',
     }
 }
 
@@ -407,7 +471,15 @@ fn run(args: Vec<String>) -> i32 {
                 eprintln!("usage: ct --compact <command> [args...]");
                 2
             } else {
-                run_external(&args[1], &args[2..], true)
+                run_external(&args[1], &args[2..], true, false)
+            }
+        }
+        "--stats" => {
+            if args.len() < 2 {
+                eprintln!("usage: ct --stats <command> [args...]");
+                2
+            } else {
+                run_external(&args[1], &args[2..], false, true)
             }
         }
         "mcp" => {
@@ -419,13 +491,14 @@ fn run(args: Vec<String>) -> i32 {
             2
         }
         "-a" => run_async_mode(&args[1..]),
-        _ => run_external(&args[0], &args[1..], false),
+        _ => run_external(&args[0], &args[1..], false, false),
     }
 }
 
 fn print_usage() {
     eprintln!("usage: ct <command> [args...]");
     eprintln!("       ct --compact <command> [args...]");
+    eprintln!("       ct --stats <command> [args...]");
     eprintln!("       ct -a <command> [args...]");
     eprintln!("       ct mcp");
     eprintln!("       ct --shell-bridge cd [args...]");
@@ -445,7 +518,7 @@ fn run_async_mode(args: &[String]) -> i32 {
         }
     };
 
-    logger.log_json("CMD", &format_command(&args[0], &args[1..]));
+    logger.log_command(&format_command(&args[0], &args[1..]));
     logger.log_raw("MODE", "\"async\"");
     logger.set_latest();
 
@@ -562,7 +635,7 @@ fn shell_bridge(args: &[String]) -> i32 {
     0
 }
 
-fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool) -> i32 {
+fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool, show_stats: bool) -> i32 {
     let config = load_global_config();
     let active_filter = command_filter_for(cmd, &config);
     let active_filter_cfg = active_filter.map(|(_, filter)| filter.clone());
@@ -594,7 +667,7 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool) -> i32 {
     };
     let logger = RunLogger::new().ok();
     if let Some(l) = &logger {
-        l.log_json("CMD", &format_command(cmd, cmd_args));
+        l.log_command(&format_command(cmd, cmd_args));
         if let Some((tool, _)) = active_filter {
             l.log_json("FILTER", tool);
         }
@@ -772,6 +845,13 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool) -> i32 {
     } else if adaptive_compact {
         flush_buffered_output(&buffered_chunks);
     }
+    if show_stats {
+        let snapshot = match stats.lock() {
+            Ok(s) => s.clone(),
+            Err(_) => CompactStats::default(),
+        };
+        print_level_stats(&snapshot);
+    }
     code
 }
 
@@ -849,49 +929,65 @@ fn capture_stream<R: Read>(
             }
         }
 
-        if let Some(l) = logger {
-            let text = String::from_utf8_lossy(&buf[..n]).to_string();
-            l.log_json(kind, &text);
-        }
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        let mut logged_any_line = false;
 
         if let Some(opts) = &options {
-            let text = String::from_utf8_lossy(&buf[..n]).to_string();
             for line in text.lines() {
-                push_tail_line(&opts.tail_lines, kind, line, TAIL_LINES);
-                update_stats(&opts.stats, line);
-                if let Some(summary) = &opts.command_summary {
-                    let mut selected_filter = opts.command_filter.clone();
-                    if selected_filter.is_none()
-                        && let Some(detector) = &opts.heuristic_detector
-                    {
-                        if let Some((tool, filter)) = detector.detect_line_if_needed(line) {
-                            if let Some(l) = logger {
-                                l.log_json("FILTER", &tool);
-                            }
-                            opts.compact_enabled.store(true, Ordering::Relaxed);
-                            opts.passthrough.store(false, Ordering::Relaxed);
-                            opts.compact_used.store(true, Ordering::Relaxed);
-                            if let Some(flag) = &opts.buffer_enabled {
-                                flag.store(false, Ordering::Relaxed);
-                            }
-                            if let Some(storage) = &opts.buffered_chunks
-                                && let Ok(mut all) = storage.lock()
-                            {
-                                all.clear();
-                            }
-                            selected_filter = Some(filter);
-                        } else {
-                            selected_filter = detector.selected_filter();
+                let mut selected_filter = opts.command_filter.clone();
+                if selected_filter.is_none() && let Some(detector) = &opts.heuristic_detector {
+                    if let Some((tool, filter)) = detector.detect_line_if_needed(line) {
+                        if let Some(l) = logger {
+                            l.log_json("FILTER", &tool);
                         }
+                        opts.compact_enabled.store(true, Ordering::Relaxed);
+                        opts.passthrough.store(false, Ordering::Relaxed);
+                        opts.compact_used.store(true, Ordering::Relaxed);
+                        if let Some(flag) = &opts.buffer_enabled {
+                            flag.store(false, Ordering::Relaxed);
+                        }
+                        if let Some(storage) = &opts.buffered_chunks
+                            && let Ok(mut all) = storage.lock()
+                        {
+                            all.clear();
+                        }
+                        selected_filter = Some(filter);
+                    } else {
+                        selected_filter = detector.selected_filter();
                     }
+                }
 
+                let level = classify_log_level(kind, line, selected_filter.as_ref());
+
+                if let Some(l) = logger {
+                    l.log_json_with_level(level, kind, line);
+                    logged_any_line = true;
+                }
+
+                push_tail_line(&opts.tail_lines, kind, line, TAIL_LINES);
+                update_stats(&opts.stats, level, line);
+                if let Some(summary) = &opts.command_summary {
                     update_command_summary(
                         summary,
                         line,
+                        level,
                         selected_filter.as_ref(),
                         opts.max_error_lines,
                     );
                 }
+            }
+        } else if let Some(l) = logger {
+            for line in text.lines() {
+                let level = classify_log_level(kind, line, None);
+                l.log_json_with_level(level, kind, line);
+                logged_any_line = true;
+            }
+        }
+
+        if !logged_any_line && !text.is_empty() {
+            if let Some(l) = logger {
+                let level = classify_log_level(kind, &text, None);
+                l.log_json_with_level(level, kind, &text);
             }
         }
     }
@@ -901,6 +997,7 @@ fn capture_stream<R: Read>(
 fn update_command_summary(
     summary: &Arc<Mutex<CommandSummary>>,
     line: &str,
+    level: char,
     command_filter: Option<&CommandFilterConfig>,
     max_error_lines: usize,
 ) {
@@ -909,30 +1006,15 @@ fn update_command_summary(
         return;
     }
     let lower = cleaned.to_ascii_lowercase();
-    let warning_patterns = command_filter
-        .map(|f| f.warning_patterns.as_slice())
-        .unwrap_or(&[]);
-    let error_patterns = command_filter
-        .map(|f| f.error_patterns.as_slice())
-        .unwrap_or(&[]);
-    let error_capture_patterns = command_filter
-        .map(|f| f.error_capture_patterns.as_slice())
-        .unwrap_or(&[]);
-
-    let is_warning = if warning_patterns.is_empty() {
-        lower.contains("warning")
+    let (is_warning, is_error, should_capture_error) = if let Some(filter) = command_filter {
+        let is_warning = contains_any_pattern(&lower, &filter.warning_patterns);
+        let is_error = contains_any_pattern(&lower, &filter.error_patterns);
+        let should_capture_error = contains_any_pattern(&lower, &filter.error_capture_patterns);
+        (is_warning, is_error, should_capture_error)
     } else {
-        contains_any_pattern(&lower, warning_patterns)
-    };
-    let is_error = if error_patterns.is_empty() {
-        lower.contains("error") || lower.contains("build failure")
-    } else {
-        contains_any_pattern(&lower, error_patterns)
-    };
-    let should_capture_error = if error_capture_patterns.is_empty() {
-        is_error
-    } else {
-        contains_any_pattern(&lower, error_capture_patterns)
+        let is_warning = level == 'W';
+        let is_error = matches!(level, 'F' | 'E');
+        (is_warning, is_error, is_error)
     };
 
     if let Ok(mut s) = summary.lock() {
@@ -961,28 +1043,84 @@ fn contains_any_pattern(lower_line: &str, patterns: &[String]) -> bool {
         .any(|pattern| lower_line.contains(&pattern))
 }
 
+fn classify_log_level(kind: &str, line: &str, command_filter: Option<&CommandFilterConfig>) -> char {
+    let cleaned = normalize_log_line(line);
+    if cleaned.is_empty() {
+        return 'T';
+    }
+
+    let lower = cleaned.to_ascii_lowercase();
+    if let Some(filter) = command_filter {
+        if contains_any_pattern(&lower, &filter.level_patterns.fatal) {
+            return 'F';
+        }
+        if contains_any_pattern(&lower, &filter.level_patterns.error) {
+            return 'E';
+        }
+        if contains_any_pattern(&lower, &filter.level_patterns.warning) {
+            return 'W';
+        }
+        if contains_any_pattern(&lower, &filter.level_patterns.info) {
+            return 'I';
+        }
+        if contains_any_pattern(&lower, &filter.level_patterns.trace) {
+            return 'T';
+        }
+        if contains_any_pattern(&lower, &filter.error_patterns) {
+            return 'E';
+        }
+        if contains_any_pattern(&lower, &filter.warning_patterns) {
+            return 'W';
+        }
+    }
+
+    match kind {
+        "STDERR" => 'U',
+        "STDOUT" => 'U',
+        _ => 'U',
+    }
+}
+
 fn print_compact_result(
     code: i32,
     command_summary: Option<&Arc<Mutex<CommandSummary>>>,
     max_error_lines: usize,
 ) {
+    let data = command_summary
+        .map(|summary| match summary.lock() {
+            Ok(s) => s.clone(),
+            Err(_) => CommandSummary::default(),
+        })
+        .unwrap_or_default();
+
     if code == 0 {
-        println!("SUCCESS");
+        if data.warning_count > 0 {
+            println!("SUCCESS ({} warnings)", data.warning_count);
+        } else {
+            println!("SUCCESS");
+        }
         return;
     }
 
     println!("FAILED");
-    if let Some(summary) = command_summary {
-        let data = match summary.lock() {
-            Ok(s) => s.clone(),
-            Err(_) => CommandSummary::default(),
-        };
-        if !data.error_lines.is_empty() {
-            for line in data.error_lines.into_iter().take(max_error_lines) {
-                println!("{line}");
-            }
+    if !data.error_lines.is_empty() {
+        for line in data.error_lines.into_iter().take(max_error_lines) {
+            println!("{line}");
         }
     }
+}
+
+fn print_level_stats(stats: &CompactStats) {
+    println!(
+        "STATS lines={} fatal={} error={} warning={} info={} trace={} unknown={}",
+        stats.line_count,
+        stats.fatal_count,
+        stats.error_count,
+        stats.warning_count,
+        stats.info_count,
+        stats.trace_count,
+        stats.unknown_count
+    );
 }
 
 fn load_global_config() -> CtConfig {
@@ -1177,17 +1315,24 @@ fn compact_tail_renderer(
     }
 }
 
-fn update_stats(stats: &Arc<Mutex<CompactStats>>, line: &str) {
+fn update_stats(stats: &Arc<Mutex<CompactStats>>, level: char, line: &str) {
     let cleaned = normalize_log_line(line);
-    let lower = cleaned.to_ascii_lowercase();
     if let Ok(mut s) = stats.lock() {
         s.line_count += 1;
-        if lower.contains("warning") {
-            s.warning_count += 1;
-        }
-        if lower.contains("error") {
-            s.error_count += 1;
-            s.last_error = cleaned.to_string();
+        match level {
+            'F' => {
+                s.fatal_count += 1;
+                s.error_count += 1;
+                s.last_error = cleaned.to_string();
+            }
+            'E' => {
+                s.error_count += 1;
+                s.last_error = cleaned.to_string();
+            }
+            'W' => s.warning_count += 1,
+            'I' => s.info_count += 1,
+            'T' => s.trace_count += 1,
+            _ => s.unknown_count += 1,
         }
     }
 }
@@ -1389,5 +1534,21 @@ mod tests {
             .detect_line_if_needed("[INFO] Scanning for projects...")
             .expect("maven line should be detected");
         assert_eq!(detected.0, "maven");
+    }
+
+    #[test]
+    fn classify_log_level_uses_maven_level_patterns() {
+        let cfg = config_with_embedded_filters();
+        let maven = cfg.filters.tools.get("maven").expect("maven filter missing");
+
+        assert_eq!(classify_log_level("STDOUT", "[INFO] Building", Some(maven)), 'I');
+        assert_eq!(
+            classify_log_level("STDOUT", "[WARNING] Deprecated API", Some(maven)),
+            'W'
+        );
+        assert_eq!(
+            classify_log_level("STDOUT", "[ERROR] Build failure", Some(maven)),
+            'E'
+        );
     }
 }

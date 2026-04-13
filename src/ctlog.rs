@@ -32,6 +32,20 @@ pub struct LogSummary {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Deserialize, Default)]
+struct LevelPatterns {
+    #[serde(default)]
+    fatal: Vec<String>,
+    #[serde(default)]
+    error: Vec<String>,
+    #[serde(default)]
+    warning: Vec<String>,
+    #[serde(default)]
+    info: Vec<String>,
+    #[serde(default)]
+    trace: Vec<String>,
+}
+
 #[derive(Clone, Deserialize)]
 struct CommandFilterConfig {
     #[serde(default)]
@@ -44,6 +58,8 @@ struct CommandFilterConfig {
     error_patterns: Vec<String>,
     #[serde(default)]
     detection_regex: Vec<String>,
+    #[serde(default)]
+    level_patterns: LevelPatterns,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +90,7 @@ impl Default for CommandFilterConfig {
             warning_patterns: default_warning_patterns(),
             error_patterns: default_error_patterns(),
             detection_regex: Vec::new(),
+            level_patterns: LevelPatterns::default(),
         }
     }
 }
@@ -139,14 +156,7 @@ pub fn summarize_log(contents: &str) -> LogSummary {
     let mut summary = LogSummary::default();
     let active_filter = resolve_filter_for_log(contents);
 
-    let warning_patterns = active_filter
-        .as_ref()
-        .map(|v| v.warning_patterns.as_slice())
-        .unwrap_or(&[]);
-    let error_patterns = active_filter
-        .as_ref()
-        .map(|v| v.error_patterns.as_slice())
-        .unwrap_or(&[]);
+    let level_patterns = active_filter.as_ref().map(|v| &v.level_patterns);
 
     for line in contents.lines() {
         let (kind, payload) = match parse_log_line(line) {
@@ -160,15 +170,29 @@ pub fn summarize_log(contents: &str) -> LogSummary {
 
         for chunk_line in payload.lines() {
             let lower = chunk_line.to_ascii_lowercase();
-            let is_warning = if warning_patterns.is_empty() {
-                lower.contains("warning")
+            let has_level_config = level_patterns
+                .map(|lp| !lp.warning.is_empty() || !lp.error.is_empty())
+                .unwrap_or(false);
+
+            let is_warning = if has_level_config {
+                level_patterns
+                    .map(|lp| contains_any_pattern(&lower, &lp.warning))
+                    .unwrap_or(false)
             } else {
-                contains_any_pattern(&lower, warning_patterns)
+                active_filter
+                    .as_ref()
+                    .map(|f| contains_any_pattern(&lower, &f.warning_patterns))
+                    .unwrap_or(false)
             };
-            let is_error = if error_patterns.is_empty() {
-                lower.contains("error") || lower.contains("build failure")
+            let is_error = if has_level_config {
+                level_patterns
+                    .map(|lp| contains_any_pattern(&lower, &lp.error))
+                    .unwrap_or(false)
             } else {
-                contains_any_pattern(&lower, error_patterns)
+                active_filter
+                    .as_ref()
+                    .map(|f| contains_any_pattern(&lower, &f.error_patterns))
+                    .unwrap_or(false)
             };
 
             if is_warning {
@@ -386,17 +410,49 @@ fn contains_any_pattern(lower_line: &str, patterns: &[String]) -> bool {
 }
 
 pub fn parse_log_line(line: &str) -> Option<(String, String)> {
-    let mut parts = line.splitn(3, ' ');
-    let _timestamp = parts.next()?;
-    let kind = parts.next()?.to_string();
-    let rest = parts.next()?.trim();
+    let (timestamp, rest) = line.split_once(' ')?;
 
-    if kind == "CMD" || kind == "STDOUT" || kind == "STDERR" || kind == "FILTER" {
-        let decoded = serde_json::from_str::<String>(rest).ok()?;
-        return Some((kind, decoded));
+    if timestamp.parse::<i64>().is_ok() {
+        let (token, after_token) = match rest.split_once(' ') {
+            Some(v) => v,
+            None => return Some(("CMD".to_string(), rest.to_string())),
+        };
+
+        if is_level_code(token) {
+            let (kind, payload) = after_token.split_once(' ')?;
+            return decode_log_payload(kind, payload);
+        }
+
+        if is_known_kind(token) {
+            return decode_log_payload(token, after_token);
+        }
+
+        return Some(("CMD".to_string(), rest.to_string()));
     }
 
-    Some((kind, rest.to_string()))
+    let (kind, payload) = rest.split_once(' ')?;
+    decode_log_payload(kind, payload)
+}
+
+fn is_level_code(token: &str) -> bool {
+    matches!(token, "F" | "E" | "W" | "I" | "T" | "U")
+}
+
+fn is_known_kind(token: &str) -> bool {
+    matches!(
+        token,
+        "CMD" | "STDOUT" | "STDERR" | "FILTER" | "MODE" | "EXIT" | "PID" | "ASYNC"
+    )
+}
+
+fn decode_log_payload(kind: &str, payload: &str) -> Option<(String, String)> {
+    let kind = kind.to_string();
+    let payload = payload.trim();
+    if kind == "CMD" || kind == "STDOUT" || kind == "STDERR" || kind == "FILTER" {
+        let decoded = serde_json::from_str::<String>(payload).ok()?;
+        return Some((kind, decoded));
+    }
+    Some((kind, payload.to_string()))
 }
 
 #[cfg(test)]
@@ -481,6 +537,22 @@ mod tests {
             "2026-01-01T00:00:00.000000Z {kind} {}",
             serde_json::to_string(payload).expect("encode payload")
         )
+    }
+
+    #[test]
+    fn parse_log_line_supports_new_cmd_header_format() {
+        let parsed = parse_log_line("1712345678901 mvn clean install")
+            .expect("new command header should parse");
+        assert_eq!(parsed.0, "CMD");
+        assert_eq!(parsed.1, "mvn clean install");
+    }
+
+    #[test]
+    fn parse_log_line_supports_level_and_kind_format() {
+        let parsed = parse_log_line("42 E STDOUT \"[ERROR] build failed\"")
+            .expect("level+kind format should parse");
+        assert_eq!(parsed.0, "STDOUT");
+        assert_eq!(parsed.1, "[ERROR] build failed");
     }
 
     fn build_stdout_only_log(raw_log: &str) -> String {
