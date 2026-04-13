@@ -1,11 +1,6 @@
 use chrono::Utc;
 use ct::ctlog::{ct_home, logs_dir, now_ts};
 use regex::Regex;
-use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use ratatui::{TerminalOptions, Viewport};
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::env;
@@ -14,7 +9,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -22,6 +17,7 @@ const MAX_COMPACT_REFRESH_HZ: u64 = 20;
 const TAIL_LINES: usize = 5;
 const ADAPTIVE_COMPACT_AFTER_SECS: u64 = 2;
 const DEFAULT_MAX_ERROR_LINES: usize = 5;
+const ADAPTIVE_COMPACT_ENV: &str = "CT_ADAPTIVE_COMPACT";
 const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 16] = [
     ("cargo.toml", include_str!("../filters.d/cargo.toml")),
     ("maven.toml", include_str!("../filters.d/maven.toml")),
@@ -44,6 +40,16 @@ const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 16] = [
 fn compact_refresh_interval() -> Duration {
     let ms = (1000 / MAX_COMPACT_REFRESH_HZ).max(1);
     Duration::from_millis(ms)
+}
+
+fn adaptive_compact_enabled() -> bool {
+    match env::var(ADAPTIVE_COMPACT_ENV) {
+        Ok(value) => {
+            let lower = value.trim().to_ascii_lowercase();
+            !matches!(lower.as_str(), "0" | "false" | "no" | "off")
+        }
+        Err(_) => true,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -274,8 +280,13 @@ impl HeuristicDetector {
             return None;
         }
 
+        let normalized = normalize_log_line(line);
+        if normalized.is_empty() {
+            return None;
+        }
+
         for candidate in self.candidates.iter() {
-            if candidate.regexes.iter().any(|re| re.is_match(line)) {
+            if candidate.regexes.iter().any(|re| re.is_match(&normalized)) {
                 let detected = (candidate.tool.clone(), candidate.filter.clone());
                 if let Ok(mut selected) = self.selected.lock()
                     && selected.is_none()
@@ -307,6 +318,8 @@ struct BufferedChunk {
 #[derive(Clone)]
 struct CaptureOptions {
     passthrough: Arc<AtomicBool>,
+    compact_enabled: Arc<AtomicBool>,
+    compact_used: Arc<AtomicBool>,
     output_flag: Arc<AtomicBool>,
     tail_lines: Arc<Mutex<VecDeque<String>>>,
     stats: Arc<Mutex<CompactStats>>,
@@ -563,7 +576,7 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool) -> i32 {
     let summary_mode = filtered_mode || heuristic_detector.is_some();
     let compact_mode = force_compact || filtered_mode;
     let interactive_tty = io::stderr().is_terminal();
-    let adaptive_compact = interactive_tty && !compact_mode;
+    let adaptive_compact = interactive_tty && !compact_mode && adaptive_compact_enabled();
     let had_output = Arc::new(AtomicBool::new(false));
     let passthrough_enabled = Arc::new(AtomicBool::new(!adaptive_compact && !compact_mode));
     let compact_enabled = Arc::new(AtomicBool::new(compact_mode));
@@ -636,9 +649,10 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool) -> i32 {
     let spinner_thread = if interactive_tty && !compact_mode {
         let running = Arc::clone(&spinner_running);
         let output_seen = Arc::clone(&had_output);
+        let compact_on = Arc::clone(&compact_enabled);
         let spinner_label = format_command(cmd, cmd_args);
         Some(thread::spawn(move || {
-            spin_wait(running, output_seen, spinner_label);
+            spin_wait(running, output_seen, compact_on, spinner_label);
         }))
     } else {
         None
@@ -647,6 +661,8 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool) -> i32 {
     let out_logger = logger.clone();
     let out_capture = CaptureOptions {
         passthrough: Arc::clone(&passthrough_enabled),
+        compact_enabled: Arc::clone(&compact_enabled),
+        compact_used: Arc::clone(&compact_used),
         output_flag: Arc::clone(&had_output),
         tail_lines: Arc::clone(&tail_lines),
         stats: Arc::clone(&stats),
@@ -672,6 +688,8 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool) -> i32 {
     let err_logger = logger.clone();
     let err_capture = CaptureOptions {
         passthrough: Arc::clone(&passthrough_enabled),
+        compact_enabled: Arc::clone(&compact_enabled),
+        compact_used: Arc::clone(&compact_used),
         output_flag: Arc::clone(&had_output),
         tail_lines: Arc::clone(&tail_lines),
         stats: Arc::clone(&stats),
@@ -850,6 +868,17 @@ fn capture_stream<R: Read>(
                             if let Some(l) = logger {
                                 l.log_json("FILTER", &tool);
                             }
+                            opts.compact_enabled.store(true, Ordering::Relaxed);
+                            opts.passthrough.store(false, Ordering::Relaxed);
+                            opts.compact_used.store(true, Ordering::Relaxed);
+                            if let Some(flag) = &opts.buffer_enabled {
+                                flag.store(false, Ordering::Relaxed);
+                            }
+                            if let Some(storage) = &opts.buffered_chunks
+                                && let Ok(mut all) = storage.lock()
+                            {
+                                all.clear();
+                            }
                             selected_filter = Some(filter);
                         } else {
                             selected_filter = detector.selected_filter();
@@ -875,7 +904,7 @@ fn update_command_summary(
     command_filter: Option<&CommandFilterConfig>,
     max_error_lines: usize,
 ) {
-    let cleaned = strip_leading_timestamp(line);
+    let cleaned = normalize_log_line(line);
     if cleaned.is_empty() {
         return;
     }
@@ -1070,7 +1099,7 @@ fn flush_buffered_output(buffered_chunks: &Arc<Mutex<Vec<BufferedChunk>>>) {
 }
 
 fn push_tail_line(tail: &Arc<Mutex<VecDeque<String>>>, kind: &str, line: &str, max: usize) {
-    let cleaned = strip_leading_timestamp(line);
+    let cleaned = normalize_log_line(line);
     if cleaned.is_empty() {
         return;
     }
@@ -1079,7 +1108,7 @@ fn push_tail_line(tail: &Arc<Mutex<VecDeque<String>>>, kind: &str, line: &str, m
         let entry = if kind == "STDERR" {
             format!("[err] {cleaned}")
         } else {
-            cleaned.to_string()
+            cleaned.clone()
         };
         q.push_back(entry);
         while q.len() > max {
@@ -1091,18 +1120,16 @@ fn push_tail_line(tail: &Arc<Mutex<VecDeque<String>>>, kind: &str, line: &str, m
 fn compact_tail_renderer(
     running: Arc<AtomicBool>,
     compact_enabled: Arc<AtomicBool>,
-    tail_lines: Arc<Mutex<VecDeque<String>>>,
+    _tail_lines: Arc<Mutex<VecDeque<String>>>,
     stats: Arc<Mutex<CompactStats>>,
     pid: u32,
     command: String,
-    max: usize,
+    _max: usize,
 ) {
-    let mut last_snapshot: Vec<String> = Vec::new();
     let mut spinner_idx = 0usize;
     let start = Instant::now();
-    let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let mut terminal = None;
-    let viewport_height = (max + 2) as u16;
+    let spinner_frames = ['|', '/', '-', '\\'];
+    let mut rendered_any = false;
 
     let refresh_interval = compact_refresh_interval();
 
@@ -1111,18 +1138,6 @@ fn compact_tail_renderer(
             thread::sleep(refresh_interval);
             continue;
         }
-
-        if terminal.is_none() {
-            let options = TerminalOptions {
-                viewport: Viewport::Inline(viewport_height),
-            };
-            terminal = ratatui::try_init_with_options(options).ok();
-        }
-
-        let snapshot = match tail_lines.lock() {
-            Ok(q) => q.iter().take(max).cloned().collect::<Vec<_>>(),
-            Err(_) => Vec::new(),
-        };
 
         let state = match stats.lock() {
             Ok(s) => s.clone(),
@@ -1139,63 +1154,31 @@ fn compact_tail_renderer(
         );
         spinner_idx += 1;
 
-        if snapshot != last_snapshot || spinner_idx % 2 == 0 {
-            if let Some(term) = terminal.as_mut() {
-                let _ = term.draw(|frame| {
-                    let areas = Layout::vertical([
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Min(1),
-                    ])
-                    .split(frame.area());
-
-                    let header_line = Line::from(vec![
-                        Span::styled(
-                            format!("{} ", header.spinner),
-                            Style::default().fg(Color::Cyan),
-                        ),
-                        Span::styled(
-                            "RUNNING ",
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(format!(
-                            "pid:{} t:{} cmd:{} lines:{} ",
-                            header.pid, header.elapsed, header.cmd_short, header.line_count
-                        )),
-                        Span::styled(
-                            format!("warn:{} ", header.warning_count),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                        Span::styled(
-                            format!("err:{} ", header.error_count),
-                            Style::default().fg(Color::Red),
-                        ),
-                        Span::styled(
-                            format!("last:{}", header.last_error),
-                            Style::default().fg(Color::Red),
-                        ),
-                    ]);
-
-                    frame.render_widget(Paragraph::new(header_line), areas[0]);
-                    frame.render_widget(Paragraph::new(""), areas[1]);
-                    frame.render_widget(Paragraph::new(snapshot.join("\n")), areas[2]);
-                });
-            }
-            last_snapshot = snapshot;
-        }
+        eprint!(
+            "\r\x1b[2K{} RUNNING pid:{} t:{} cmd:{} lines:{} warn:{} err:{} last:{}",
+            header.spinner,
+            header.pid,
+            header.elapsed,
+            header.cmd_short,
+            header.line_count,
+            header.warning_count,
+            header.error_count,
+            header.last_error
+        );
+        let _ = io::stderr().flush();
+        rendered_any = true;
 
         thread::sleep(refresh_interval);
     }
 
-    if terminal.is_some() {
-        let _ = ratatui::try_restore();
+    if rendered_any {
+        eprint!("\r\x1b[2K");
+        let _ = io::stderr().flush();
     }
 }
 
 fn update_stats(stats: &Arc<Mutex<CompactStats>>, line: &str) {
-    let cleaned = strip_leading_timestamp(line);
+    let cleaned = normalize_log_line(line);
     let lower = cleaned.to_ascii_lowercase();
     if let Ok(mut s) = stats.lock() {
         s.line_count += 1;
@@ -1213,10 +1196,34 @@ fn strip_leading_timestamp(line: &str) -> &str {
     let trimmed = line.trim();
     if let Some(rest) = trimmed.strip_prefix('[')
         && let Some(end_idx) = rest.find(']')
+        && timestamp_prefix_regex().is_match(rest[..end_idx].trim())
     {
         return rest[end_idx + 1..].trim_start();
     }
     trimmed
+}
+
+fn timestamp_prefix_regex() -> &'static Regex {
+    static TS_RE: OnceLock<Regex> = OnceLock::new();
+    TS_RE.get_or_init(|| {
+        Regex::new(
+            r"^(?:\d{4}-\d{2}-\d{2}(?:[T ][0-9:.+\-Z]+)?|\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)$",
+        )
+        .expect("valid timestamp regex")
+    })
+}
+
+fn ansi_regex() -> &'static Regex {
+    static ANSI_RE: OnceLock<Regex> = OnceLock::new();
+    ANSI_RE.get_or_init(|| {
+        Regex::new(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\))")
+            .expect("valid ANSI regex")
+    })
+}
+
+fn normalize_log_line(line: &str) -> String {
+    let without_ansi = ansi_regex().replace_all(line, "");
+    strip_leading_timestamp(without_ansi.as_ref()).to_string()
 }
 
 fn format_elapsed(elapsed: Duration) -> String {
@@ -1278,10 +1285,18 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
-fn spin_wait(running: Arc<AtomicBool>, output_seen: Arc<AtomicBool>, label: String) {
+fn spin_wait(
+    running: Arc<AtomicBool>,
+    output_seen: Arc<AtomicBool>,
+    compact_enabled: Arc<AtomicBool>,
+    label: String,
+) {
     let frames = ['|', '/', '-', '\\'];
     let mut idx = 0usize;
-    while running.load(Ordering::Relaxed) && !output_seen.load(Ordering::Relaxed) {
+    while running.load(Ordering::Relaxed)
+        && !output_seen.load(Ordering::Relaxed)
+        && !compact_enabled.load(Ordering::Relaxed)
+    {
         eprint!("\r{} Running {}", frames[idx % frames.len()], label);
         let _ = io::stderr().flush();
         idx += 1;
@@ -1349,4 +1364,30 @@ fn shell_escape(input: &str) -> String {
 
     let escaped = input.replace('\'', "'\\''");
     format!("'{escaped}'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_embedded_filters() -> CtConfig {
+        let mut cfg = CtConfig::default();
+        for (tool, profile) in load_embedded_filter_profiles() {
+            cfg.filters.tools.insert(tool, profile);
+        }
+        cfg
+    }
+
+    #[test]
+    fn heuristic_detector_detects_maven_lines() {
+        let cfg = config_with_embedded_filters();
+        let maven = cfg.filters.tools.get("maven").expect("maven filter missing");
+        assert!(maven.enabled);
+        assert!(!maven.detection_regex.is_empty());
+        let detector = HeuristicDetector::from_config(&cfg).expect("heuristics should be enabled");
+        let detected = detector
+            .detect_line_if_needed("[INFO] Scanning for projects...")
+            .expect("maven line should be detected");
+        assert_eq!(detected.0, "maven");
+    }
 }
