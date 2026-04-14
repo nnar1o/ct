@@ -19,6 +19,13 @@ const TAIL_LINES: usize = 5;
 const ADAPTIVE_COMPACT_AFTER_SECS: u64 = 2;
 const DEFAULT_MAX_ERROR_LINES: usize = 5;
 const ADAPTIVE_COMPACT_ENV: &str = "CT_ADAPTIVE_COMPACT";
+const MIN_CONFIDENCE_FOR_PROGRESS: i64 = 60;
+const MIN_SAMPLES_FOR_CONFIDENCE_FILTER: usize = 4;
+const SAMPLE_TARGET_FOR_CONFIDENCE: usize = 6;
+const MAD_WORST_THRESHOLD: f64 = 25.0;
+const BIMODAL_LOW_SPLIT: i64 = 33;
+const BIMODAL_HIGH_SPLIT: i64 = 67;
+const BIMODAL_PENALTY: f64 = 0.6;
 const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 16] = [
     ("cargo.toml", include_str!("../filters.d/cargo.toml")),
     ("maven.toml", include_str!("../filters.d/maven.toml")),
@@ -377,16 +384,46 @@ fn parse_stats_percent_map(content: &str) -> HashMap<String, i64> {
         if line.trim().is_empty() || line.starts_with("EXEC ") || line == "EXEC-END" {
             continue;
         }
-        let mut parts = line.split_whitespace();
-        let Some(hash) = parts.next() else {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 2 {
             continue;
-        };
-        let Some(percent_raw) = parts.next() else {
-            continue;
-        };
+        }
+
+        let hash = tokens[0];
+        let percent_raw = tokens[1];
         let Some(percent) = percent_raw.parse::<i64>().ok() else {
             continue;
         };
+
+        let mut metadata_numbers: Vec<i64> = Vec::new();
+        let mut first_entry_idx: Option<usize> = None;
+        for (idx, token) in tokens.iter().enumerate().skip(2) {
+            if token.contains(':') {
+                first_entry_idx = Some(idx);
+                break;
+            }
+            if let Ok(value) = token.parse::<i64>() {
+                metadata_numbers.push(value);
+            }
+        }
+
+        let samples = first_entry_idx
+            .map(|idx| tokens[idx..].iter().filter(|t| t.contains(':')).count())
+            .unwrap_or(0);
+
+        let confidence = if metadata_numbers.len() >= 2 {
+            Some(metadata_numbers[1].clamp(0, 100))
+        } else {
+            None
+        };
+
+        if let Some(conf) = confidence
+            && samples >= MIN_SAMPLES_FOR_CONFIDENCE_FILTER
+            && conf < MIN_CONFIDENCE_FOR_PROGRESS
+        {
+            continue;
+        }
+
         out.insert(hash.to_string(), percent.clamp(0, 100));
     }
     out
@@ -438,6 +475,58 @@ fn parse_stats_hash_line(line: &str) -> Option<(String, Vec<(i64, i64)>)> {
     }
 
     Some((hash, entries))
+}
+
+fn median_i64(values: &mut [i64]) -> i64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        (values[mid - 1] + values[mid]) / 2
+    }
+}
+
+fn compute_percent_and_confidence(sample_percents: &[i64], kept_runs: usize) -> (i64, i64) {
+    if sample_percents.is_empty() || kept_runs == 0 {
+        return (0, 0);
+    }
+
+    let mut for_median = sample_percents.to_vec();
+    let median = median_i64(&mut for_median).clamp(0, 100);
+
+    let mut deviations: Vec<i64> = sample_percents
+        .iter()
+        .map(|p| (p - median).abs())
+        .collect();
+    let mad = median_i64(&mut deviations) as f64;
+
+    let sample_score =
+        (sample_percents.len() as f64 / SAMPLE_TARGET_FOR_CONFIDENCE as f64).clamp(0.0, 1.0);
+    let coverage_score = (sample_percents.len() as f64 / kept_runs as f64).clamp(0.0, 1.0);
+    let spread_score = (1.0 - (mad / MAD_WORST_THRESHOLD).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+
+    let low_count = sample_percents
+        .iter()
+        .filter(|&&p| p <= BIMODAL_LOW_SPLIT)
+        .count();
+    let high_count = sample_percents
+        .iter()
+        .filter(|&&p| p >= BIMODAL_HIGH_SPLIT)
+        .count();
+    let bimodal_penalty = if low_count > 0 && high_count > 0 {
+        BIMODAL_PENALTY
+    } else {
+        1.0
+    };
+
+    let confidence = (100.0 * sample_score * coverage_score * spread_score * bimodal_penalty)
+        .round() as i64;
+
+    (median, confidence.clamp(0, 100))
 }
 
 fn merge_stats_content(
@@ -510,25 +599,23 @@ fn merge_stats_content(
     }
 
     for (hash, entries) in ordered_hash_lines {
-        let mut pct_sum: i64 = 0;
-        let mut pct_count: i64 = 0;
+        let mut sample_percents: Vec<i64> = Vec::new();
         for (entry_exec_ts, rel_ts) in &entries {
             if let Some(duration_for_run) = run_duration_by_ts.get(entry_exec_ts) {
                 if *duration_for_run > 0 {
                     let pct = ((*rel_ts * 100) / *duration_for_run).clamp(0, 100);
-                    pct_sum += pct;
-                    pct_count += 1;
+                    sample_percents.push(pct);
                 }
             }
         }
-        let percent = if pct_count > 0 { pct_sum / pct_count } else { 0 };
+        let (percent, confidence) = compute_percent_and_confidence(&sample_percents, kept_exec_ts.len());
         let avg_rel = entries.iter().map(|(_, rel_ts)| *rel_ts).sum::<i64>() / entries.len() as i64;
         let joined = entries
             .iter()
             .map(|(entry_exec_ts, rel_ts)| format!("{}:{}", entry_exec_ts, rel_ts))
             .collect::<Vec<_>>()
             .join(" ");
-        out.push_str(&format!("{} {} {} {}\n", hash, percent, avg_rel, joined));
+        out.push_str(&format!("{} {} {} {} {}\n", hash, percent, avg_rel, confidence, joined));
     }
     out
 }
@@ -1883,7 +1970,8 @@ mod tests {
         assert_eq!(tokens[0], hash);
         assert_eq!(tokens[1], "9");
         assert_eq!(tokens[2], "15");
-        assert_eq!(&tokens[3..], &["1000:10", "2000:20"]);
+        assert_eq!(tokens[3], "33");
+        assert_eq!(&tokens[4..], &["1000:10", "2000:20"]);
     }
 
     #[test]
@@ -1899,7 +1987,7 @@ mod tests {
             .find(|l| l.starts_with("abc "))
             .expect("abc line missing");
         let tokens: Vec<&str> = hash_line.split_whitespace().collect();
-        assert_eq!(tokens, vec!["abc", "4", "5", "1000:5"]);
+        assert_eq!(tokens, vec!["abc", "4", "5", "17", "1000:5"]);
     }
 
     #[test]
@@ -1930,9 +2018,10 @@ mod tests {
         assert_eq!(tokens[0], "abc");
         assert_eq!(tokens[1], "100");
         assert_eq!(tokens[2], "7");
-        assert_eq!(tokens.len(), 13);
-        assert_eq!(tokens[3], "3000:3");
-        assert_eq!(tokens[12], "12000:12");
+        assert_eq!(tokens[3], "100");
+        assert_eq!(tokens.len(), 14);
+        assert_eq!(tokens[4], "3000:3");
+        assert_eq!(tokens[13], "12000:12");
     }
 
     #[test]
@@ -1949,7 +2038,8 @@ mod tests {
         assert_eq!(tokens[0], "abc");
         assert_eq!(tokens[1], "9");
         assert_eq!(tokens[2], "15");
-        assert_eq!(&tokens[3..], &["1000:10", "2000:20"]);
+        assert_eq!(tokens[3], "33");
+        assert_eq!(&tokens[4..], &["1000:10", "2000:20"]);
     }
 
     #[test]
@@ -1964,23 +2054,49 @@ mod tests {
             .find(|l| l.starts_with("abc "))
             .expect("abc line missing");
         let abc_tokens: Vec<&str> = abc_line.split_whitespace().collect();
-        assert_eq!(abc_tokens, vec!["abc", "9", "10", "1000:10"]);
+        assert_eq!(abc_tokens, vec!["abc", "9", "10", "8", "1000:10"]);
 
         let def_line = merged
             .lines()
             .find(|l| l.starts_with("def "))
             .expect("def line missing");
         let def_tokens: Vec<&str> = def_line.split_whitespace().collect();
-        assert_eq!(def_tokens, vec!["def", "15", "25", "1000:20", "2000:30"]);
+        assert_eq!(def_tokens, vec!["def", "15", "25", "31", "1000:20", "2000:30"]);
     }
 
     #[test]
     fn parse_stats_percent_map_reads_hash_percent_pairs() {
-        let content = "EXEC 1000 111\nEXEC-END\nabc 35 120 1000:120\ndef 90 200 1000:200\n";
+        let content = "EXEC 1000 111\nEXEC-END\nabc 35 120 78 1000:120\ndef 90 200 42 1000:10 2000:20 3000:30 4000:40\n";
         let map = parse_stats_percent_map(content);
 
         assert_eq!(map.get("abc"), Some(&35));
-        assert_eq!(map.get("def"), Some(&90));
+        assert_eq!(map.get("def"), None);
+    }
+
+    #[test]
+    fn parse_stats_percent_map_keeps_low_confidence_when_samples_are_few() {
+        let content = "EXEC 1000 111\nEXEC-END\nabc 35 120 17 1000:120 2000:140\n";
+        let map = parse_stats_percent_map(content);
+        assert_eq!(map.get("abc"), Some(&35));
+    }
+
+    #[test]
+    fn parse_stats_percent_map_supports_old_format_without_confidence() {
+        let content = "EXEC 1000 111\nEXEC-END\nabc 35 120 1000:120\n";
+        let map = parse_stats_percent_map(content);
+        assert_eq!(map.get("abc"), Some(&35));
+    }
+
+    #[test]
+    fn compute_percent_and_confidence_penalizes_unstable_hashes() {
+        let stable = vec![10, 12, 11, 10, 9, 11];
+        let (stable_percent, stable_confidence) = compute_percent_and_confidence(&stable, 6);
+        assert_eq!(stable_percent, 10);
+        assert!(stable_confidence >= 85);
+
+        let unstable = vec![8, 90, 12, 85, 10, 88];
+        let (_unstable_percent, unstable_confidence) = compute_percent_and_confidence(&unstable, 6);
+        assert!(unstable_confidence <= 40);
     }
 
     #[test]
