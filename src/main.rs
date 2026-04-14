@@ -369,13 +369,16 @@ fn parse_exec_header(line: &str) -> Option<(i64, i64)> {
 fn parse_stats_hash_line(line: &str) -> Option<(String, Vec<(i64, i64)>)> {
     let mut parts = line.split_whitespace();
     let hash = parts.next()?.to_string();
-    let flag = parts.next()?;
-    if flag != "0" {
+    let percent = parts.next()?;
+    if percent.parse::<i64>().is_err() {
         return None;
     }
 
     let mut entries = Vec::new();
     for token in parts {
+        if !token.contains(':') {
+            continue;
+        }
         let mut ts = token.split(':');
         let exec_ts: i64 = ts.next()?.parse().ok()?;
         let rel_ts: i64 = ts.next()?.parse().ok()?;
@@ -450,18 +453,34 @@ fn merge_stats_content(
     }
     ordered_hash_lines.sort_by(|a, b| a.0.cmp(&b.0));
 
+    let run_duration_by_ts: HashMap<i64, i64> = ordered_exec_runs.iter().copied().collect();
+
     let mut out = String::new();
     for (run_exec_ts, run_duration) in ordered_exec_runs {
         out.push_str(&format!("EXEC {} {}\n", run_exec_ts, run_duration));
         out.push_str("EXEC-END\n");
     }
+
     for (hash, entries) in ordered_hash_lines {
+        let mut pct_sum: i64 = 0;
+        let mut pct_count: i64 = 0;
+        for (entry_exec_ts, rel_ts) in &entries {
+            if let Some(duration_for_run) = run_duration_by_ts.get(entry_exec_ts) {
+                if *duration_for_run > 0 {
+                    let pct = ((*rel_ts * 100) / *duration_for_run).clamp(0, 100);
+                    pct_sum += pct;
+                    pct_count += 1;
+                }
+            }
+        }
+        let percent = if pct_count > 0 { pct_sum / pct_count } else { 0 };
+        let avg_rel = entries.iter().map(|(_, rel_ts)| *rel_ts).sum::<i64>() / entries.len() as i64;
         let joined = entries
             .iter()
             .map(|(entry_exec_ts, rel_ts)| format!("{}:{}", entry_exec_ts, rel_ts))
             .collect::<Vec<_>>()
             .join(" ");
-        out.push_str(&format!("{} 0 {}\n", hash, joined));
+        out.push_str(&format!("{} {} {} {}\n", hash, percent, avg_rel, joined));
     }
     out
 }
@@ -1770,8 +1789,9 @@ mod tests {
             .expect("hash line missing");
         let tokens: Vec<&str> = hash_line.split_whitespace().collect();
         assert_eq!(tokens[0], hash);
-        assert_eq!(tokens[1], "0");
-        assert_eq!(&tokens[2..], &["1000:10", "2000:20"]);
+        assert_eq!(tokens[1], "9");
+        assert_eq!(tokens[2], "15");
+        assert_eq!(&tokens[3..], &["1000:10", "2000:20"]);
     }
 
     #[test]
@@ -1787,7 +1807,7 @@ mod tests {
             .find(|l| l.starts_with("abc "))
             .expect("abc line missing");
         let tokens: Vec<&str> = hash_line.split_whitespace().collect();
-        assert_eq!(tokens, vec!["abc", "0", "1000:5"]);
+        assert_eq!(tokens, vec!["abc", "4", "5", "1000:5"]);
     }
 
     #[test]
@@ -1816,9 +1836,49 @@ mod tests {
             .expect("abc line missing");
         let tokens: Vec<&str> = hash_line.split_whitespace().collect();
         assert_eq!(tokens[0], "abc");
-        assert_eq!(tokens[1], "0");
-        assert_eq!(tokens.len(), 12);
-        assert_eq!(tokens[2], "3000:3");
-        assert_eq!(tokens[11], "12000:12");
+        assert_eq!(tokens[1], "100");
+        assert_eq!(tokens[2], "7");
+        assert_eq!(tokens.len(), 13);
+        assert_eq!(tokens[3], "3000:3");
+        assert_eq!(tokens[12], "12000:12");
+    }
+
+    #[test]
+    fn merge_stats_reads_previous_format_without_average_field() {
+        let existing = "EXEC 1000 111\nEXEC-END\nabc 0 1000:10 2000:20\n";
+        let current: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+
+        let merged = merge_stats_content(existing, 2000, 222, &current);
+        let hash_line = merged
+            .lines()
+            .find(|l| l.starts_with("abc "))
+            .expect("abc line missing");
+        let tokens: Vec<&str> = hash_line.split_whitespace().collect();
+        assert_eq!(tokens[0], "abc");
+        assert_eq!(tokens[1], "9");
+        assert_eq!(tokens[2], "15");
+        assert_eq!(&tokens[3..], &["1000:10", "2000:20"]);
+    }
+
+    #[test]
+    fn merge_stats_computes_percent_from_relative_position() {
+        let existing =
+            "EXEC 1000 111\nEXEC-END\nEXEC 2000 222\nEXEC-END\nabc 0 1000:10\ndef 0 1000:20 2000:30\n";
+        let current: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+
+        let merged = merge_stats_content(existing, 2000, 222, &current);
+        let abc_line = merged
+            .lines()
+            .find(|l| l.starts_with("abc "))
+            .expect("abc line missing");
+        let abc_tokens: Vec<&str> = abc_line.split_whitespace().collect();
+        assert_eq!(abc_tokens, vec!["abc", "9", "10", "1000:10"]);
+
+        let def_line = merged
+            .lines()
+            .find(|l| l.starts_with("def "))
+            .expect("def line missing");
+        let def_tokens: Vec<&str> = def_line.split_whitespace().collect();
+        assert_eq!(def_tokens, vec!["def", "15", "25", "1000:20", "2000:30"]);
     }
 }
