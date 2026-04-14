@@ -1,5 +1,6 @@
 use chrono::Utc;
 use ct::ctlog::{ct_home, logs_dir};
+use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
@@ -1527,12 +1528,14 @@ fn compact_tail_renderer(
     command: String,
     _max: usize,
 ) {
-    let mut spinner_idx = 0usize;
     let start = Instant::now();
-    let spinner_frames = ['|', '/', '-', '\\'];
     let mut rendered_any = false;
+    let mut showing_progress_bar = false;
 
     let refresh_interval = compact_refresh_interval();
+    let progress = ProgressBar::new(100);
+    progress.enable_steady_tick(refresh_interval);
+    progress.set_style(compact_render_style(false));
 
     while running.load(Ordering::Relaxed) {
         if !compact_enabled.load(Ordering::Relaxed) {
@@ -1546,37 +1549,45 @@ fn compact_tail_renderer(
         };
 
         let elapsed = format_elapsed(start.elapsed());
-        let header = format_compact_header(
-            spinner_frames[spinner_idx % spinner_frames.len()],
-            pid,
-            &command,
-            &elapsed,
-            &state,
-        );
-        spinner_idx += 1;
+        let header = format_compact_header(pid, &command, &elapsed, &state);
+        let has_progress = state.progress_percent.is_some();
+        if has_progress != showing_progress_bar {
+            progress.set_style(compact_render_style(has_progress));
+            showing_progress_bar = has_progress;
+        }
 
-        eprint!(
-            "\r\x1b[2K{} RUNNING pid:{} t:{} cmd:{} lines:{} warn:{} err:{}{} last:{}",
-            header.spinner,
+        progress.set_position(state.progress_percent.unwrap_or(0).clamp(0, 100) as u64);
+        progress.set_message(format!(
+            "pid:{} t:{} cmd:{} lines:{} warn:{} err:{} last:{}",
             header.pid,
             header.elapsed,
             header.cmd_short,
             header.line_count,
             header.warning_count,
             header.error_count,
-            header.progress,
             header.last_error
-        );
-        let _ = io::stderr().flush();
+        ));
+
         rendered_any = true;
 
         thread::sleep(refresh_interval);
     }
 
     if rendered_any {
-        eprint!("\r\x1b[2K");
-        let _ = io::stderr().flush();
+        progress.finish_and_clear();
     }
+}
+
+fn compact_render_style(show_progress_bar: bool) -> ProgressStyle {
+    let base = if show_progress_bar {
+        "{spinner:.cyan} RUNNING {msg} {bar:16.cyan/blue} {pos:>3}%"
+    } else {
+        "{spinner:.cyan} RUNNING {msg}"
+    };
+    ProgressStyle::with_template(base)
+        .expect("valid compact progress template")
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
+        .progress_chars("█░")
 }
 
 fn update_progress_from_history(
@@ -1672,19 +1683,16 @@ fn format_elapsed(elapsed: Duration) -> String {
 }
 
 struct CompactHeader {
-    spinner: char,
     pid: u32,
     elapsed: String,
     cmd_short: String,
     line_count: u64,
     warning_count: u64,
     error_count: u64,
-    progress: String,
     last_error: String,
 }
 
 fn format_compact_header(
-    spinner: char,
     pid: u32,
     command: &str,
     elapsed: &str,
@@ -1696,20 +1704,14 @@ fn format_compact_header(
     } else {
         truncate(&stats.last_error, 48)
     };
-    let progress = stats
-        .progress_percent
-        .map(|value| format!(" pct:{}%", value.clamp(0, 100)))
-        .unwrap_or_default();
 
     CompactHeader {
-        spinner,
         pid,
         elapsed: elapsed.to_string(),
         cmd_short,
         line_count: stats.line_count,
         warning_count: stats.warning_count,
         error_count: stats.error_count,
-        progress,
         last_error,
     }
 }
@@ -1982,10 +1984,32 @@ mod tests {
     }
 
     #[test]
-    fn compact_header_hides_progress_without_historical_stats() {
-        let stats = CompactStats::default();
-        let header = format_compact_header('|', 123, "cargo test", "00:05", &stats);
-        assert!(header.progress.is_empty());
+    fn compact_header_formats_core_fields() {
+        let mut stats = CompactStats {
+            line_count: 42,
+            warning_count: 3,
+            error_count: 1,
+            last_error: "this is a test error line".to_string(),
+            ..CompactStats::default()
+        };
+        let header = format_compact_header(123, "cargo test", "00:05", &stats);
+        assert_eq!(header.pid, 123);
+        assert_eq!(header.elapsed, "00:05");
+        assert_eq!(header.cmd_short, "cargo test");
+        assert_eq!(header.line_count, 42);
+        assert_eq!(header.warning_count, 3);
+        assert_eq!(header.error_count, 1);
+        assert_eq!(header.last_error, "this is a test error line");
+
+        stats.last_error.clear();
+        let header_no_error = format_compact_header(123, "cargo test", "00:05", &stats);
+        assert_eq!(header_no_error.last_error, "-");
+    }
+
+    #[test]
+    fn compact_render_style_templates_are_valid() {
+        let _ = compact_render_style(false);
+        let _ = compact_render_style(true);
     }
 
     #[test]
