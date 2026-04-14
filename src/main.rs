@@ -330,6 +330,8 @@ struct RunLogger {
     log_path: PathBuf,
     start_ts_ms: i64,
     seen_hashes: Arc<Mutex<std::collections::HashSet<String>>>,
+    hash_timestamps: Arc<Mutex<std::collections::HashMap<String, Vec<(i64, i64)>>>>,
+    exit_logged: Arc<Mutex<bool>>,
 }
 
 #[derive(Clone)]
@@ -356,14 +358,124 @@ struct CaptureOptions {
     seq: Option<Arc<AtomicU64>>,
 }
 
+fn parse_exec_header(line: &str) -> Option<(i64, i64)> {
+    let rest = line.strip_prefix("EXEC ")?;
+    let mut parts = rest.split_whitespace();
+    let exec_ts = parts.next()?.parse().ok()?;
+    let duration = parts.next()?.parse().ok()?;
+    Some((exec_ts, duration))
+}
+
+fn parse_stats_hash_line(line: &str) -> Option<(String, Vec<(i64, i64)>)> {
+    let mut parts = line.split_whitespace();
+    let hash = parts.next()?.to_string();
+    let flag = parts.next()?;
+    if flag != "0" {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    for token in parts {
+        let mut ts = token.split(':');
+        let exec_ts: i64 = ts.next()?.parse().ok()?;
+        let rel_ts: i64 = ts.next()?.parse().ok()?;
+        entries.push((exec_ts, rel_ts));
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    Some((hash, entries))
+}
+
+fn merge_stats_content(
+    existing: &str,
+    exec_ts: i64,
+    duration: i64,
+    current_run: &HashMap<String, Vec<(i64, i64)>>,
+) -> String {
+    let mut exec_runs: HashMap<i64, i64> = HashMap::new();
+    let mut hash_history: HashMap<String, std::collections::HashSet<(i64, i64)>> = HashMap::new();
+
+    for line in existing.lines() {
+        if let Some((ts, dur)) = parse_exec_header(line) {
+            exec_runs.insert(ts, dur);
+            continue;
+        }
+        if line == "EXEC-END" || line.trim().is_empty() {
+            continue;
+        }
+        if let Some((hash, entries)) = parse_stats_hash_line(line) {
+            let set = hash_history.entry(hash).or_default();
+            for pair in entries {
+                set.insert(pair);
+            }
+        }
+    }
+
+    exec_runs.insert(exec_ts, duration);
+
+    let mut ordered_exec_runs: Vec<(i64, i64)> = exec_runs.into_iter().collect();
+    ordered_exec_runs.sort_by_key(|(ts, _)| *ts);
+    if ordered_exec_runs.len() > 10 {
+        ordered_exec_runs = ordered_exec_runs.split_off(ordered_exec_runs.len() - 10);
+    }
+    let kept_exec_ts: std::collections::HashSet<i64> =
+        ordered_exec_runs.iter().map(|(ts, _)| *ts).collect();
+
+    for (hash, entries) in current_run {
+        let set = hash_history.entry(hash.clone()).or_default();
+        for &(entry_exec_ts, rel_ts) in entries {
+            if kept_exec_ts.contains(&entry_exec_ts) {
+                set.insert((entry_exec_ts, rel_ts));
+            }
+        }
+    }
+
+    let mut ordered_hash_lines: Vec<(String, Vec<(i64, i64)>)> = Vec::new();
+    for (hash, entries) in hash_history {
+        let mut filtered: Vec<(i64, i64)> = entries
+            .into_iter()
+            .filter(|(entry_exec_ts, _)| kept_exec_ts.contains(entry_exec_ts))
+            .collect();
+        if filtered.is_empty() {
+            continue;
+        }
+        filtered.sort_by_key(|(entry_exec_ts, rel_ts)| (*entry_exec_ts, *rel_ts));
+        if filtered.len() > 10 {
+            filtered = filtered.split_off(filtered.len() - 10);
+        }
+        ordered_hash_lines.push((hash, filtered));
+    }
+    ordered_hash_lines.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = String::new();
+    for (run_exec_ts, run_duration) in ordered_exec_runs {
+        out.push_str(&format!("EXEC {} {}\n", run_exec_ts, run_duration));
+        out.push_str("EXEC-END\n");
+    }
+    for (hash, entries) in ordered_hash_lines {
+        let joined = entries
+            .iter()
+            .map(|(entry_exec_ts, rel_ts)| format!("{}:{}", entry_exec_ts, rel_ts))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!("{} 0 {}\n", hash, joined));
+    }
+    out
+}
+
 impl RunLogger {
-    fn new() -> io::Result<Self> {
+    fn new(cmd: &str) -> io::Result<Self> {
         let dir = logs_dir()?;
         fs::create_dir_all(&dir)?;
 
-        let run_id = format!("{}-{}", Utc::now().timestamp_micros(), process::id());
-        let log_path = dir.join(format!("{run_id}.log"));
-        let sh_path = dir.join(format!("{run_id}.logsh"));
+        let cmd_hash = format!("{:x}", md5::compute(cmd.as_bytes()));
+        let timestamp = Utc::now().timestamp_millis();
+        let run_id = format!("{}-{}", &cmd_hash[..8], timestamp);
+        let log_path = dir.join(format!("{}.log", run_id));
+        let sh_path = dir.join(format!("{}.logsh", run_id));
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -378,8 +490,10 @@ impl RunLogger {
             file: Arc::new(Mutex::new(file)),
             sh_file: Arc::new(Mutex::new(sh_file)),
             log_path,
-            start_ts_ms: Utc::now().timestamp_millis(),
+            start_ts_ms: timestamp,
             seen_hashes: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            hash_timestamps: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            exit_logged: Arc::new(Mutex::new(false)),
         })
     }
 
@@ -403,6 +517,11 @@ impl RunLogger {
     }
 
     fn log_exit(&self, code: i32) {
+        let mut logged = self.exit_logged.lock().unwrap();
+        if *logged {
+            return;
+        }
+        *logged = true;
         let level = if code == 0 { 'I' } else { 'E' };
         self.log_raw_with_level(level, "EXIT", &code.to_string());
     }
@@ -412,6 +531,32 @@ impl RunLogger {
             let latest_path = self.log_path.with_file_name(".latest");
             let _ = fs::write(latest_path, name);
         }
+        self.write_stats();
+    }
+
+    fn write_stats(&self) {
+        let cmd_hash = self
+            .log_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.split('-').next())
+            .unwrap_or("unknown");
+        let stats_path = self
+            .log_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(format!("{}.stats", cmd_hash));
+        let exec_ts = self.start_ts_ms;
+        let duration = Utc::now().timestamp_millis().saturating_sub(self.start_ts_ms);
+
+        let existing = fs::read_to_string(&stats_path).unwrap_or_default();
+        let current_run = self
+            .hash_timestamps
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let content = merge_stats_content(&existing, exec_ts, duration, &current_run);
+        let _ = fs::write(&stats_path, content);
     }
 
     fn log_raw(&self, kind: &str, payload: &str) {
@@ -428,20 +573,28 @@ impl RunLogger {
         }
         let normalized: String = payload.chars().filter(|c| !c.is_ascii_digit()).collect();
         let hash = format!("{:x}", md5::compute(normalized.as_bytes()));
-        let mut already_seen = false;
-        if let Ok(mut seen) = self.seen_hashes.lock() {
+
+        let already_seen;
+        {
+            let mut seen = self.seen_hashes.lock().unwrap();
             if seen.contains(&hash) {
                 already_seen = true;
             } else {
                 seen.insert(hash.clone());
+                already_seen = false;
             }
         }
+
         if !already_seen {
             let sh_line = format!("{} {}\n", rel_ms, hash);
             if let Ok(mut sh) = self.sh_file.lock() {
                 if let Some(ref mut f) = *sh {
                     let _ = f.write_all(sh_line.as_bytes());
                 }
+            }
+            if let Ok(mut ts_map) = self.hash_timestamps.lock() {
+                let entry = ts_map.entry(hash).or_insert_with(Vec::new);
+                entry.push((self.start_ts_ms, rel_ms));
             }
         }
     }
@@ -463,6 +616,8 @@ impl RunLogger {
             log_path: path,
             start_ts_ms,
             seen_hashes: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            hash_timestamps: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            exit_logged: Arc::new(Mutex::new(false)),
         })
     }
 
@@ -538,7 +693,8 @@ fn run_async_mode(args: &[String]) -> i32 {
         return 2;
     }
 
-    let logger = match RunLogger::new() {
+    let cmd = format_command(&args[0], &args[1..]);
+    let logger = match RunLogger::new(&cmd) {
         Ok(l) => l,
         Err(err) => {
             eprintln!("ct: failed to initialize logger: {err}");
@@ -546,7 +702,7 @@ fn run_async_mode(args: &[String]) -> i32 {
         }
     };
 
-    logger.log_command(&format_command(&args[0], &args[1..]));
+    logger.log_command(&cmd);
     logger.log_raw("MODE", "\"async\"");
     logger.set_latest();
 
@@ -693,9 +849,10 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool, show_stats:
     } else {
         None
     };
-    let logger = RunLogger::new().ok();
+    let full_cmd = format_command(cmd, cmd_args);
+    let logger = RunLogger::new(&full_cmd).ok();
     if let Some(l) = &logger {
-        l.log_command(&format_command(cmd, cmd_args));
+        l.log_command(&full_cmd);
         if let Some((tool, _)) = active_filter {
             l.log_json("FILTER", tool);
         }
@@ -1578,5 +1735,90 @@ mod tests {
             classify_log_level("STDOUT", "[ERROR] Build failure", Some(maven)),
             'E'
         );
+    }
+
+    #[test]
+    fn stats_file_name_is_per_command_hash() {
+        let log_path = PathBuf::from("/tmp/c5792326-1776109764924.log");
+        let cmd_hash = log_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.split('-').next())
+            .unwrap();
+        let stats_path = log_path
+            .parent()
+            .unwrap()
+            .join(format!("{}.stats", cmd_hash));
+        assert_eq!(stats_path.file_name().unwrap().to_str().unwrap(), "c5792326.stats");
+    }
+
+    #[test]
+    fn merge_stats_accumulates_hash_history_across_runs() {
+        let hash = "00e85f9db78e94b8d9b5d64b07d15534";
+        let existing = format!("EXEC 1000 111\nEXEC-END\n{} 0 1000:10\n", hash);
+
+        let mut current: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+        current.insert(hash.to_string(), vec![(2000, 20)]);
+
+        let merged = merge_stats_content(&existing, 2000, 222, &current);
+        assert_eq!(merged.matches("EXEC ").count(), 2);
+        assert_eq!(merged.matches("EXEC-END").count(), 2);
+
+        let hash_line = merged
+            .lines()
+            .find(|l| l.starts_with(hash))
+            .expect("hash line missing");
+        let tokens: Vec<&str> = hash_line.split_whitespace().collect();
+        assert_eq!(tokens[0], hash);
+        assert_eq!(tokens[1], "0");
+        assert_eq!(&tokens[2..], &["1000:10", "2000:20"]);
+    }
+
+    #[test]
+    fn merge_stats_deduplicates_identical_timestamps() {
+        let existing = "EXEC 1000 111\nEXEC-END\nabc 0 1000:5 1000:5\n";
+
+        let mut current: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+        current.insert("abc".to_string(), vec![(1000, 5), (1000, 5)]);
+
+        let merged = merge_stats_content(existing, 1000, 111, &current);
+        let hash_line = merged
+            .lines()
+            .find(|l| l.starts_with("abc "))
+            .expect("abc line missing");
+        let tokens: Vec<&str> = hash_line.split_whitespace().collect();
+        assert_eq!(tokens, vec!["abc", "0", "1000:5"]);
+    }
+
+    #[test]
+    fn merge_stats_keeps_only_last_10_runs() {
+        let mut existing = String::new();
+        existing.push_str("abc 0");
+        for i in 1..=12 {
+            let ts = i * 1000;
+            existing.push_str(&format!(" {}:{}", ts, i));
+        }
+        existing.push('\n');
+        for i in 1..=12 {
+            let ts = i * 1000;
+            existing.push_str(&format!("EXEC {} {}\nEXEC-END\n", ts, i));
+        }
+
+        let current: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+        let merged = merge_stats_content(&existing, 12000, 12, &current);
+
+        assert_eq!(merged.matches("EXEC ").count(), 10);
+        assert_eq!(merged.matches("EXEC-END").count(), 10);
+
+        let hash_line = merged
+            .lines()
+            .find(|l| l.starts_with("abc "))
+            .expect("abc line missing");
+        let tokens: Vec<&str> = hash_line.split_whitespace().collect();
+        assert_eq!(tokens[0], "abc");
+        assert_eq!(tokens[1], "0");
+        assert_eq!(tokens.len(), 12);
+        assert_eq!(tokens[2], "3000:3");
+        assert_eq!(tokens[11], "12000:12");
     }
 }
