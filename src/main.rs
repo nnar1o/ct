@@ -62,6 +62,7 @@ struct CompactStats {
     trace_count: u64,
     unknown_count: u64,
     last_error: String,
+    progress_percent: Option<i64>,
 }
 
 #[derive(Clone, Default)]
@@ -356,6 +357,52 @@ struct CaptureOptions {
     buffered_chunks: Option<Arc<Mutex<Vec<BufferedChunk>>>>,
     buffer_enabled: Option<Arc<AtomicBool>>,
     seq: Option<Arc<AtomicU64>>,
+    historical_percents: Option<Arc<HashMap<String, i64>>>,
+}
+
+fn payload_hash(payload: &str) -> String {
+    let normalized: String = payload.chars().filter(|c| !c.is_ascii_digit()).collect();
+    format!("{:x}", md5::compute(normalized.as_bytes()))
+}
+
+fn line_hash_for_stats(line: &str) -> Option<String> {
+    let payload = serde_json::to_string(line).ok()?;
+    Some(payload_hash(&payload))
+}
+
+fn parse_stats_percent_map(content: &str) -> HashMap<String, i64> {
+    let mut out = HashMap::new();
+    for line in content.lines() {
+        if line.trim().is_empty() || line.starts_with("EXEC ") || line == "EXEC-END" {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(percent_raw) = parts.next() else {
+            continue;
+        };
+        let Some(percent) = percent_raw.parse::<i64>().ok() else {
+            continue;
+        };
+        out.insert(hash.to_string(), percent.clamp(0, 100));
+    }
+    out
+}
+
+fn load_stats_percent_map_for_command(command: &str) -> HashMap<String, i64> {
+    let cmd_hash = format!("{:x}", md5::compute(command.as_bytes()));
+    let cmd_hash_prefix = &cmd_hash[..8];
+    let dir = match logs_dir() {
+        Ok(d) => d,
+        Err(_) => return HashMap::new(),
+    };
+    let stats_path = dir.join(format!("{}.stats", cmd_hash_prefix));
+    match fs::read_to_string(stats_path) {
+        Ok(content) => parse_stats_percent_map(&content),
+        Err(_) => HashMap::new(),
+    }
 }
 
 fn parse_exec_header(line: &str) -> Option<(i64, i64)> {
@@ -590,8 +637,7 @@ impl RunLogger {
         if let Ok(mut file) = self.file.lock() {
             let _ = file.write_all(line.as_bytes());
         }
-        let normalized: String = payload.chars().filter(|c| !c.is_ascii_digit()).collect();
-        let hash = format!("{:x}", md5::compute(normalized.as_bytes()));
+        let hash = payload_hash(payload);
 
         let already_seen;
         {
@@ -869,6 +915,12 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool, show_stats:
         None
     };
     let full_cmd = format_command(cmd, cmd_args);
+    let historical_percents = load_stats_percent_map_for_command(&full_cmd);
+    let historical_percents = if historical_percents.is_empty() {
+        None
+    } else {
+        Some(Arc::new(historical_percents))
+    };
     let logger = RunLogger::new(&full_cmd).ok();
     if let Some(l) = &logger {
         l.log_command(&full_cmd);
@@ -950,6 +1002,7 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool, show_stats:
         buffered_chunks: Some(Arc::clone(&buffered_chunks)),
         buffer_enabled: Some(Arc::clone(&buffer_enabled)),
         seq: Some(Arc::clone(&chunk_seq)),
+        historical_percents: historical_percents.clone(),
     };
     let out_thread = thread::spawn(move || {
         if let Some(mut reader) = stdout {
@@ -977,6 +1030,7 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool, show_stats:
         buffered_chunks: Some(Arc::clone(&buffered_chunks)),
         buffer_enabled: Some(Arc::clone(&buffer_enabled)),
         seq: Some(Arc::clone(&chunk_seq)),
+        historical_percents,
     };
     let err_thread = thread::spawn(move || {
         if let Some(mut reader) = stderr {
@@ -1169,6 +1223,11 @@ fn capture_stream<R: Read>(
                 }
 
                 push_tail_line(&opts.tail_lines, kind, line, TAIL_LINES);
+                update_progress_from_history(
+                    &opts.stats,
+                    line,
+                    opts.historical_percents.as_deref(),
+                );
                 update_stats(&opts.stats, level, line);
                 if let Some(summary) = &opts.command_summary {
                     update_command_summary(
@@ -1497,7 +1556,7 @@ fn compact_tail_renderer(
         spinner_idx += 1;
 
         eprint!(
-            "\r\x1b[2K{} RUNNING pid:{} t:{} cmd:{} lines:{} warn:{} err:{} last:{}",
+            "\r\x1b[2K{} RUNNING pid:{} t:{} cmd:{} lines:{} warn:{} err:{}{} last:{}",
             header.spinner,
             header.pid,
             header.elapsed,
@@ -1505,6 +1564,7 @@ fn compact_tail_renderer(
             header.line_count,
             header.warning_count,
             header.error_count,
+            header.progress,
             header.last_error
         );
         let _ = io::stderr().flush();
@@ -1516,6 +1576,30 @@ fn compact_tail_renderer(
     if rendered_any {
         eprint!("\r\x1b[2K");
         let _ = io::stderr().flush();
+    }
+}
+
+fn update_progress_from_history(
+    stats: &Arc<Mutex<CompactStats>>,
+    line: &str,
+    historical_percents: Option<&HashMap<String, i64>>,
+) {
+    let Some(history) = historical_percents else {
+        return;
+    };
+    let Some(hash) = line_hash_for_stats(line) else {
+        return;
+    };
+    let Some(percent) = history.get(&hash) else {
+        return;
+    };
+
+    if let Ok(mut s) = stats.lock() {
+        let next = (*percent).clamp(0, 100);
+        s.progress_percent = Some(match s.progress_percent {
+            Some(current) => current.max(next),
+            None => next,
+        });
     }
 }
 
@@ -1595,6 +1679,7 @@ struct CompactHeader {
     line_count: u64,
     warning_count: u64,
     error_count: u64,
+    progress: String,
     last_error: String,
 }
 
@@ -1611,6 +1696,10 @@ fn format_compact_header(
     } else {
         truncate(&stats.last_error, 48)
     };
+    let progress = stats
+        .progress_percent
+        .map(|value| format!(" pct:{}%", value.clamp(0, 100)))
+        .unwrap_or_default();
 
     CompactHeader {
         spinner,
@@ -1620,6 +1709,7 @@ fn format_compact_header(
         line_count: stats.line_count,
         warning_count: stats.warning_count,
         error_count: stats.error_count,
+        progress,
         last_error,
     }
 }
@@ -1880,5 +1970,38 @@ mod tests {
             .expect("def line missing");
         let def_tokens: Vec<&str> = def_line.split_whitespace().collect();
         assert_eq!(def_tokens, vec!["def", "15", "25", "1000:20", "2000:30"]);
+    }
+
+    #[test]
+    fn parse_stats_percent_map_reads_hash_percent_pairs() {
+        let content = "EXEC 1000 111\nEXEC-END\nabc 35 120 1000:120\ndef 90 200 1000:200\n";
+        let map = parse_stats_percent_map(content);
+
+        assert_eq!(map.get("abc"), Some(&35));
+        assert_eq!(map.get("def"), Some(&90));
+    }
+
+    #[test]
+    fn compact_header_hides_progress_without_historical_stats() {
+        let stats = CompactStats::default();
+        let header = format_compact_header('|', 123, "cargo test", "00:05", &stats);
+        assert!(header.progress.is_empty());
+    }
+
+    #[test]
+    fn update_progress_from_history_sets_max_progress() {
+        let stats = Arc::new(Mutex::new(CompactStats::default()));
+        let mut history = HashMap::new();
+
+        let hash_a = line_hash_for_stats("ALPHA").expect("hash for ALPHA");
+        let hash_b = line_hash_for_stats("BETA").expect("hash for BETA");
+        history.insert(hash_a, 22);
+        history.insert(hash_b, 61);
+
+        update_progress_from_history(&stats, "ALPHA", Some(&history));
+        update_progress_from_history(&stats, "BETA", Some(&history));
+
+        let snapshot = stats.lock().expect("lock stats").clone();
+        assert_eq!(snapshot.progress_percent, Some(61));
     }
 }
