@@ -1,0 +1,13 @@
+tool = "terraform"
+enabled = true
+aliases = ["terraform", "tf"]
+warning_patterns = ["warning:", "deprecated:"]
+error_patterns = ["error:", "fatal error", "failed", "panic:"]
+error_capture_patterns = ["error:", "fatal error", "failed", "on "]
+detection_regex = [
+  '^\S+:\s+(Refreshing state|Creating|Modifying|Destroying|Still)',
+  '^Plan:\s+[0-9]+\s+to add,\s+[0-9]+\s+to change,\s+[0-9]+\s+to destroy\.',
+  '^No changes\.',
+  '^Apply complete!',
+  '^Error:\s+',
+]

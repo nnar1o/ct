@@ -1,0 +1,13 @@
+tool = "bazel"
+enabled = true
+aliases = ["bazel", "bazelisk", "bzl"]
+warning_patterns = ["warning:"]
+error_patterns = ["error:", "fail:", "failed", "build did not complete"]
+error_capture_patterns = ["error:", "fail:", "build did not complete"]
+detection_regex = [
+  '^INFO:\s+(Analyzed|Found|Elapsed|From)\s+',
+  '^Loading:\s+',
+  '^\[[0-9]+/[0-9]+\]\s+',
+  '^ERROR:\s+',
+  '^FAIL:\s+',
+]

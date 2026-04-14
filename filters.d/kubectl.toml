@@ -1,0 +1,24 @@
+tool = "kubectl"
+enabled = true
+aliases = ["kubectl", "k"]
+warning_patterns = ["warning", " warning "]
+error_patterns = [
+  "error from server:",
+  "notfound",
+  "connection refused",
+  "the server was unable",
+  "forbidden",
+]
+error_capture_patterns = [
+  "error from server:",
+  "connection refused",
+  "forbidden",
+  "timed out",
+]
+detection_regex = [
+  '^Events:',
+  '^Conditions:',
+  '^\s+(Warning|Normal)\s+',
+  '^NAME\s+',
+  '^NAMESPACE\s+',
+]

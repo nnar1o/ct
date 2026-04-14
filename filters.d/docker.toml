@@ -1,0 +1,23 @@
+tool = "docker"
+enabled = true
+aliases = ["docker"]
+warning_patterns = ["warning:", "warn:"]
+error_patterns = [
+  "error:",
+  "failed to solve",
+  "did not complete successfully",
+  "exited with code",
+  "pull access denied",
+]
+error_capture_patterns = [
+  "error:",
+  "failed to solve",
+  "did not complete successfully",
+  "pull access denied",
+]
+detection_regex = [
+  '^#[0-9]+\s+\[[^\]]+\]\s+',
+  '^Step\s+[0-9]+/[0-9]+\s*:',
+  '^CACHED\s+\[[^\]]+\]\s+',
+  '^Successfully\s+(built|tagged)\s+',
+]

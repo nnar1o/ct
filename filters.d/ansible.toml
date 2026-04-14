@@ -1,0 +1,13 @@
+tool = "ansible"
+enabled = true
+aliases = ["ansible-playbook", "ansible"]
+warning_patterns = ["[warning]:", "[deprecation warning]:"]
+error_patterns = ["fatal:", "failed!", "failed:", "unreachable:", "error!"]
+error_capture_patterns = ["fatal:", "failed!", "unreachable:", "error!"]
+detection_regex = [
+  '^PLAY\s+\[.+\]\s+\*+',
+  '^TASK\s+\[.+\]\s+\*+',
+  '^ok:\s+\[',
+  '^changed:\s+\[',
+  '^PLAY RECAP\s+\*+',
+]

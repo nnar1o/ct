@@ -1,0 +1,24 @@
+tool = "pip"
+enabled = true
+aliases = ["pip", "pip3"]
+warning_patterns = ["warning:"]
+error_patterns = [
+  "error:",
+  "failed building wheel",
+  "subprocess-exited-with-error",
+  "could not find a version",
+  "no matching distribution found",
+]
+error_capture_patterns = [
+  "error:",
+  "failed building wheel",
+  "subprocess-exited-with-error",
+  "no matching distribution found",
+]
+detection_regex = [
+  '^Collecting\s+\S+',
+  '^Downloading\s+\S+',
+  '^Installing collected packages:',
+  '^Successfully installed\s+',
+  '^Requirement already satisfied:',
+]

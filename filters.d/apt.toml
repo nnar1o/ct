@@ -1,0 +1,14 @@
+tool = "apt"
+enabled = true
+aliases = ["apt", "apt-get", "aptitude"]
+warning_patterns = ["w:", "warning"]
+error_patterns = ["e:", "dpkg: error", "errors were encountered", "sub-process"]
+error_capture_patterns = ["e:", "dpkg: error", "errors were encountered", "sub-process"]
+detection_regex = [
+  '^Reading package lists\.\.\.\s+Done',
+  '^Building dependency tree\.\.\.\s+Done',
+  '^The following\s+(NEW|extra|upgraded)',
+  '^Unpacking\s+\S+',
+  '^Setting up\s+\S+',
+  '^Processing triggers for\s+',
+]

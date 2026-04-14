@@ -26,7 +26,7 @@ const MAD_WORST_THRESHOLD: f64 = 25.0;
 const BIMODAL_LOW_SPLIT: i64 = 33;
 const BIMODAL_HIGH_SPLIT: i64 = 67;
 const BIMODAL_PENALTY: f64 = 0.6;
-const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 16] = [
+const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 24] = [
     ("cargo.toml", include_str!("../filters.d/cargo.toml")),
     ("maven.toml", include_str!("../filters.d/maven.toml")),
     ("gradle.toml", include_str!("../filters.d/gradle.toml")),
@@ -43,6 +43,17 @@ const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 16] = [
     ("dotnet.toml", include_str!("../filters.d/dotnet.toml")),
     ("jest.toml", include_str!("../filters.d/jest.toml")),
     ("vitest.toml", include_str!("../filters.d/vitest.toml")),
+    ("docker.toml", include_str!("../filters.d/docker.toml")),
+    (
+        "docker-compose.toml",
+        include_str!("../filters.d/docker-compose.toml"),
+    ),
+    ("kubectl.toml", include_str!("../filters.d/kubectl.toml")),
+    ("terraform.toml", include_str!("../filters.d/terraform.toml")),
+    ("ansible.toml", include_str!("../filters.d/ansible.toml")),
+    ("pip.toml", include_str!("../filters.d/pip.toml")),
+    ("bazel.toml", include_str!("../filters.d/bazel.toml")),
+    ("apt.toml", include_str!("../filters.d/apt.toml")),
 ];
 
 fn compact_refresh_interval() -> Duration {
@@ -984,11 +995,15 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool, show_stats:
     let max_error_lines = config.output.max_error_lines;
     let filtered_mode = active_filter.is_some();
     let summary_mode = filtered_mode || heuristic_detector.is_some();
-    let compact_mode = force_compact || filtered_mode;
     let interactive_tty = io::stderr().is_terminal();
-    let adaptive_compact = interactive_tty && !compact_mode && adaptive_compact_enabled();
+    let (compact_mode, adaptive_compact, initial_passthrough) = compact_mode_flags(
+        force_compact,
+        filtered_mode,
+        interactive_tty,
+        adaptive_compact_enabled(),
+    );
     let had_output = Arc::new(AtomicBool::new(false));
-    let passthrough_enabled = Arc::new(AtomicBool::new(!adaptive_compact && !compact_mode));
+    let passthrough_enabled = Arc::new(AtomicBool::new(initial_passthrough));
     let compact_enabled = Arc::new(AtomicBool::new(compact_mode));
     let compact_used = Arc::new(AtomicBool::new(compact_mode));
     let process_running = Arc::new(AtomicBool::new(true));
@@ -1199,6 +1214,18 @@ fn run_external(cmd: &str, cmd_args: &[String], force_compact: bool, show_stats:
         print_level_stats(&snapshot);
     }
     code
+}
+
+fn compact_mode_flags(
+    force_compact: bool,
+    filtered_mode: bool,
+    interactive_tty: bool,
+    adaptive_enabled: bool,
+) -> (bool, bool, bool) {
+    let compact_mode = force_compact || filtered_mode;
+    let adaptive_compact = interactive_tty && !compact_mode && adaptive_enabled;
+    let passthrough = !adaptive_compact && !compact_mode;
+    (compact_mode, adaptive_compact, passthrough)
 }
 
 fn command_filter_for<'a>(cmd: &str, cfg: &'a CtConfig) -> Option<(&'a str, &'a CommandFilterConfig)> {
@@ -1917,6 +1944,83 @@ mod tests {
             .detect_line_if_needed("[INFO] Scanning for projects...")
             .expect("maven line should be detected");
         assert_eq!(detected.0, "maven");
+    }
+
+    #[test]
+    fn embedded_filters_include_new_popular_profiles() {
+        let cfg = config_with_embedded_filters();
+        for tool in [
+            "docker",
+            "docker-compose",
+            "kubectl",
+            "terraform",
+            "ansible",
+            "pip",
+            "bazel",
+            "apt",
+        ] {
+            let filter = cfg
+                .filters
+                .tools
+                .get(tool)
+                .unwrap_or_else(|| panic!("{tool} filter missing"));
+            assert!(filter.enabled, "{tool} should be enabled");
+            assert!(
+                !filter.detection_regex.is_empty(),
+                "{tool} should have detection regexes"
+            );
+            assert!(
+                !filter.error_patterns.is_empty(),
+                "{tool} should have error patterns"
+            );
+        }
+    }
+
+    #[test]
+    fn command_filter_for_matches_new_profile_aliases() {
+        let cfg = config_with_embedded_filters();
+        let docker_compose = command_filter_for("compose", &cfg)
+            .expect("compose alias should resolve to docker-compose");
+        assert_eq!(docker_compose.0, "docker-compose");
+
+        let kubectl = command_filter_for("k", &cfg).expect("k alias should resolve to kubectl");
+        assert_eq!(kubectl.0, "kubectl");
+
+        let terraform = command_filter_for("tf", &cfg).expect("tf alias should resolve to terraform");
+        assert_eq!(terraform.0, "terraform");
+
+        let pip = command_filter_for("pip3", &cfg).expect("pip3 alias should resolve to pip");
+        assert_eq!(pip.0, "pip");
+    }
+
+    #[test]
+    fn compact_mode_flags_use_buffering_before_adaptive_timeout() {
+        let (compact_mode, adaptive_compact, passthrough) =
+            compact_mode_flags(false, false, true, true);
+        assert!(!compact_mode);
+        assert!(adaptive_compact);
+        assert!(
+            !passthrough,
+            "adaptive mode buffers output first and only switches to compact after timeout"
+        );
+    }
+
+    #[test]
+    fn compact_mode_flags_force_compact_immediately() {
+        let (compact_mode, adaptive_compact, passthrough) =
+            compact_mode_flags(true, false, true, true);
+        assert!(compact_mode);
+        assert!(!adaptive_compact);
+        assert!(!passthrough);
+    }
+
+    #[test]
+    fn compact_mode_flags_keep_passthrough_without_tty() {
+        let (compact_mode, adaptive_compact, passthrough) =
+            compact_mode_flags(false, false, false, true);
+        assert!(!compact_mode);
+        assert!(!adaptive_compact);
+        assert!(passthrough);
     }
 
     #[test]

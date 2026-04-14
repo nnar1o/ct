@@ -7,7 +7,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 16] = [
+const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 24] = [
     ("cargo.toml", include_str!("../filters.d/cargo.toml")),
     ("maven.toml", include_str!("../filters.d/maven.toml")),
     ("gradle.toml", include_str!("../filters.d/gradle.toml")),
@@ -24,6 +24,17 @@ const BUILTIN_FILTER_PROFILE_FILES: [(&str, &str); 16] = [
     ("dotnet.toml", include_str!("../filters.d/dotnet.toml")),
     ("jest.toml", include_str!("../filters.d/jest.toml")),
     ("vitest.toml", include_str!("../filters.d/vitest.toml")),
+    ("docker.toml", include_str!("../filters.d/docker.toml")),
+    (
+        "docker-compose.toml",
+        include_str!("../filters.d/docker-compose.toml"),
+    ),
+    ("kubectl.toml", include_str!("../filters.d/kubectl.toml")),
+    ("terraform.toml", include_str!("../filters.d/terraform.toml")),
+    ("ansible.toml", include_str!("../filters.d/ansible.toml")),
+    ("pip.toml", include_str!("../filters.d/pip.toml")),
+    ("bazel.toml", include_str!("../filters.d/bazel.toml")),
+    ("apt.toml", include_str!("../filters.d/apt.toml")),
 ];
 
 #[derive(Default)]
@@ -557,6 +568,34 @@ mod tests {
 
     fn build_stdout_only_log(raw_log: &str) -> String {
         format!("{}\n", encode_ct_line("STDOUT", raw_log))
+    }
+
+    #[test]
+    fn embedded_profiles_include_new_popular_tools() {
+        let filters = load_embedded_filter_profiles();
+        for tool in [
+            "docker",
+            "docker-compose",
+            "kubectl",
+            "terraform",
+            "ansible",
+            "pip",
+            "bazel",
+            "apt",
+        ] {
+            let filter = filters
+                .get(tool)
+                .unwrap_or_else(|| panic!("{tool} filter missing"));
+            assert!(filter.enabled, "{tool} should be enabled");
+            assert!(
+                !filter.detection_regex.is_empty(),
+                "{tool} should provide detection regexes"
+            );
+            assert!(
+                !filter.error_patterns.is_empty(),
+                "{tool} should provide error patterns"
+            );
+        }
     }
 
     #[test]
